@@ -1,0 +1,20 @@
+# Captures & results
+*.pcap
+*.pcapng
+*_results.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+tmp/
+*.tmp
