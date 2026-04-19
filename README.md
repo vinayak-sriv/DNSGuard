@@ -1,7 +1,7 @@
 # DNSGuard 🛡️
 ### AI-Powered DNS Threat Intelligence & Real-Time Tunneling Detection System
 
-> **Final Year Project — B.Tech Computer Science & Engineering**
+> **Network Security Project — B.Tech Computer Science & Engineering**
 > Vinayak Srivastava (500119362) · Sumit Singh Chauhan (500120276)
 > Supervised by Dr. Richa Kumari
 
