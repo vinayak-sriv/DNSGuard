@@ -1,31 +1,58 @@
 """
-DNS Shield — Integrated Dashboard v6
-python3 dashboard.py  →  http://127.0.0.1:8080
-Integrates pcap_detector.py: full tunneling feature display.
-New in v6:
-  - /live/push  : real-time event ingestion from pcap_detector live mode
-  - /live/status: TunnelIPTracker registry endpoint
-  - Live Feed tab: animated real-time alert stream
-  - Confirmed Tunnels tab: full TunnelIPTracker summary for non-technical users
-  - Plain-English labels throughout
+DNSGuard dashboard.
+
+Run with ``python dashboard.py`` and open http://127.0.0.1:8080.
+The dashboard accepts offline PCAP uploads and live events from
+``pcap_detector.py``.
 
 How to connect pcap_detector.py (live mode) to this dashboard:
   Call POST /live/push with JSON:
     { "event": <scored_row_dict>, "tracker": <tracker.get_all() snapshot> }
-  The dashboard will surface new events in the Live Feed tab and update
-  the Confirmed Tunnels registry automatically.
+  The dashboard surfaces new events in the Live Feed tab and updates the
+  confirmed tunnel registry automatically.
 """
+import datetime
 import importlib.util
 import math
 import os
 import tempfile
 import threading
+from ipaddress import ip_address
 from pathlib import Path
-from flask import Flask, jsonify, render_template_string, request, Response
+from flask import Flask, jsonify, request, Response
 
-MAX_CONTENT_LENGTH = 200 * 1024 * 1024
+
+def _env_int(name, default, minimum=1):
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
+def _coerce_positive_int(value, default, field_name):
+    if value in (None, ""):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return parsed
+
+
+MAX_CONTENT_LENGTH = _env_int("DNS_SHIELD_MAX_UPLOAD_MB", 64) * 1024 * 1024
 DEFAULT_UPLOAD_SUFFIX = ".pcap"
-DETECTOR_ENV_VAR = "PCAP_DETECTOR_PATH"
+ALLOW_REMOTE = os.environ.get("DNS_SHIELD_ALLOW_REMOTE", "").strip() == "1"
+MAX_PUSH_ROWS = _env_int("DNS_SHIELD_MAX_PUSH_ROWS", 50000)
+MAX_TRACKER_ITEMS = _env_int("DNS_SHIELD_MAX_TRACKER_ITEMS", 1000)
+MAX_LIVE_BATCH = _env_int("DNS_SHIELD_MAX_LIVE_BATCH", 200)
+MAX_STORED_LIVE_EVENTS = _env_int("DNS_SHIELD_MAX_STORED_LIVE_EVENTS", 200)
+MAX_VISIBLE_LIVE_EVENTS = _env_int("DNS_SHIELD_MAX_VISIBLE_LIVE_EVENTS", 100)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -70,7 +97,7 @@ def _snapshot():
 
 
 def _detector_candidates():
-    env_path = os.environ.get(DETECTOR_ENV_VAR)
+    env_path = os.environ.get("PCAP_DETECTOR_PATH")
     candidates = [
         Path(env_path) if env_path else None,
         Path(__file__).with_name("pcap_detector.py"),
@@ -97,7 +124,8 @@ _detector_cache: dict = {}
 def _load_detector_module():
     if "module" in _detector_cache:
         return _detector_cache["module"], _detector_cache["path"]
-    for detector_path in _detector_candidates():
+    candidates = _detector_candidates()
+    for detector_path in candidates:
         if not detector_path.is_file():
             continue
         spec = importlib.util.spec_from_file_location(
@@ -110,7 +138,7 @@ def _load_detector_module():
         _detector_cache["module"] = module
         _detector_cache["path"] = detector_path
         return module, detector_path
-    searched = "\n".join(str(path) for path in _detector_candidates())
+    searched = "\n".join(str(p) for p in candidates)
     raise FileNotFoundError(
         "Could not find pcap_detector.py. "
         "Set PCAP_DETECTOR_PATH or place the detector in one of these paths:\n"
@@ -169,58 +197,116 @@ def _save_uploaded_file(file_storage):
 
 
 def _remove_file(path):
-    try:
-        Path(path).unlink(missing_ok=True)
-    except TypeError:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+    Path(path).unlink(missing_ok=True)
 
 
 def _error_response(message, status_code):
     return jsonify({"error": message}), status_code
 
 
-def _live_snapshot():
+def _is_loopback_address(value):
+    if not value:
+        return False
+    host = value.split("%", 1)[0]
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return host.lower() == "localhost"
+
+
+def _require_local_access():
+    if ALLOW_REMOTE:
+        return None
+    if request.headers.get("X-Forwarded-For"):
+        return _error_response(
+            "Dashboard API is restricted to localhost. Set DNS_SHIELD_ALLOW_REMOTE=1 to opt in to remote access.",
+            403,
+        )
+    if _is_loopback_address(request.remote_addr):
+        return None
+    return _error_response(
+        "Dashboard API is restricted to localhost. Set DNS_SHIELD_ALLOW_REMOTE=1 to opt in to remote access.",
+        403,
+    )
+
+
+def _normalize_ingested_row(row):
+    if not isinstance(row, dict):
+        raise ValueError("Each row must be a JSON object")
+    normalized = {str(key): _json_safe(value) for key, value in row.items()}
+    normalized["rule_reasons"] = _normalize_rule_reasons(normalized.get("rule_reasons"))
+    normalized["rule_reasons_text"] = "; ".join(normalized["rule_reasons"])
+    return normalized
+
+
+def _normalize_tracker_snapshot(tracker):
+    if not isinstance(tracker, dict):
+        raise ValueError("Tracker snapshot must be a JSON object")
+    normalized = {}
+    for ip, info in list(tracker.items())[:MAX_TRACKER_ITEMS]:
+        key = str(ip)
+        if isinstance(info, dict):
+            normalized[key] = {str(k): _json_safe(v) for k, v in info.items()}
+        else:
+            normalized[key] = {"value": _json_safe(info)}
+    return normalized
+
+
+def _live_snapshot(since=None):
     with _live_lock:
-        snap = dict(_live_store)
-        snap["events"] = list(_live_store["events"])
-        snap["tracker"] = dict(_live_store["tracker"])
-        snap["stats"] = dict(_live_store["stats"])
-        return snap
+        events = [dict(event) for event in _live_store["events"]]
+        if since is not None and since > 0:
+            new_events = [
+                dict(event)
+                for event in events
+                if int(event.get("_event_version", 0)) > since
+            ]
+            events_payload = None
+        else:
+            new_events = list(events)
+            events_payload = events
+        return {
+            **_live_store,
+            "events": events_payload,
+            "new_events": new_events,
+            "tracker": dict(_live_store["tracker"]),
+            "stats":   dict(_live_store["stats"]),
+        }
 
 
 def _push_live_event(event: dict, tracker: dict, interface: str = "", window_seconds: int = 300):
     """Thread-safe ingestion of a single real-time scored row."""
     with _live_lock:
+        next_version = _live_store["version"] + 1
+        stored_event = _normalize_ingested_row(event)
+        stored_event["_event_version"] = next_version
         _live_store["mode"] = "live"
         if interface:
             _live_store["interface"] = interface
         _live_store["window_seconds"] = window_seconds
         if _live_store["started_at"] is None:
-            import datetime as _dt
-            _live_store["started_at"] = _dt.datetime.now().isoformat()
+            _live_store["started_at"] = datetime.datetime.now().isoformat()
 
-        # Keep newest 200 events
+        # Keep newest N events
         events = _live_store["events"]
-        events.insert(0, event)
-        if len(events) > 200:
+        events.insert(0, stored_event)
+        if len(events) > MAX_STORED_LIVE_EVENTS:
             events.pop()
 
         # Merge tracker snapshot
-        _live_store["tracker"].update(tracker)
+        if tracker:
+            _live_store["tracker"].update(tracker)
 
         # Update rolling stats
-        rl = str(event.get("risk_level", "")).lower()
-        pred = str(event.get("prediction", ""))
+        rl = str(stored_event.get("risk_level", "")).lower()
+        pred = str(stored_event.get("prediction", ""))
         s = _live_store["stats"]
         s["total"] += 1
         if rl in s:
             s[rl] += 1
         if pred == "TUNNEL":
             s["tunnel"] += 1
-        _live_store["version"] += 1
+        _live_store["version"] = next_version
 
 
 def _run_detector_pipeline(pcap_path):
@@ -232,7 +318,6 @@ def _run_detector_pipeline(pcap_path):
 
     return {
         "data": rows,
-        "records": rows,
         "pcap_name": Path(pcap_path).name,
         "thresholds": dict(getattr(detector, "THRESHOLDS", {})),
         "summary": _build_summary(rows, detector_path),
@@ -244,7 +329,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>DNS Shield · Threat Analysis</title>
+<title>DNSGuard · Threat Analysis</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
@@ -256,10 +341,11 @@ HTML = r"""<!DOCTYPE html>
   --bord:rgba(21,34,53,.08);--bord2:rgba(36,84,215,.16);--bord3:rgba(36,84,215,.28);
   --txt:#162336;--t2:#667385;--t3:#8d97a6;
   --cy:#2454d7;--cy2:rgba(36,84,215,.11);--cy3:rgba(36,84,215,.06);--cy4:rgba(36,84,215,.03);
-  --red:#c44b40;--red2:rgba(196,75,64,.14);--red3:rgba(196,75,64,.06);
-  --grn:#2e7a54;--grn2:rgba(46,122,84,.12);--grn3:rgba(46,122,84,.05);
-  --amb:#c77a18;--amb2:rgba(199,122,24,.14);--amb3:rgba(199,122,24,.06);
-  --pur:#7c3aed;--pur2:rgba(124,58,237,.12);--pur3:rgba(124,58,237,.06);
+  --red:#c44b40;--red2:rgba(196,75,64,.14);--red3:rgba(196,75,64,.08);
+  --grn:#2e7a54;--grn2:rgba(46,122,84,.12);--grn3:rgba(46,122,84,.07);
+  --amb:#c77a18;--amb2:rgba(199,122,24,.14);--amb3:rgba(199,122,24,.08);
+  --pur:#7c3aed;--pur2:rgba(124,58,237,.12);--pur3:rgba(124,58,237,.08);
+  --bord4:#c8d4e2;
   --syne:'Space Grotesk',sans-serif;--dm:'Manrope',sans-serif;--mono:'IBM Plex Mono',monospace;
   --r4:4px;--r8:10px;--r12:16px;--r16:22px;--r20:26px;--r24:32px;
 }
@@ -279,7 +365,7 @@ header{flex-shrink:0;height:78px;margin:16px 16px 0;padding:0 22px;background:rg
 .hd-sep{width:1px;height:22px;background:var(--bord);flex-shrink:0}
 #hd-file{font-family:var(--mono);font-size:11px;color:var(--t3);background:rgba(255,255,255,.76);border:1px solid var(--bord);border-radius:999px;padding:8px 14px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:all .25s}
 #hd-file.loaded{color:var(--txt);border-color:rgba(36,84,215,.18);background:var(--cy3)}
-.hd-r{margin-left:auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.hd-r{margin-left:auto;display:flex;align-items:center;gap:10px;flex-wrap:nowrap;overflow:hidden}
 .live-pill{display:flex;align-items:center;gap:8px;background:var(--grn3);border:1px solid rgba(46,122,84,.16);border-radius:999px;padding:8px 14px;font-size:11px;font-weight:700;color:var(--grn);font-family:var(--mono);letter-spacing:.04em}
 .live-dot{width:8px;height:8px;border-radius:50%;background:var(--grn);position:relative;flex-shrink:0}
 .live-dot::after{content:'';position:absolute;inset:-4px;border-radius:50%;border:1.5px solid rgba(46,122,84,.35);animation:pulse-ring 2.5s ease infinite;opacity:0}
@@ -294,10 +380,11 @@ header{flex-shrink:0;height:78px;margin:16px 16px 0;padding:0 22px;background:rg
 /* NAV */
 nav{flex-shrink:0;height:52px;margin:10px 16px 0;background:rgba(255,255,255,.70);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border:1px solid var(--bord);border-radius:18px;padding:6px 8px;display:flex;align-items:center;gap:4px;position:relative;z-index:100;box-shadow:0 14px 36px rgba(21,34,53,.08);overflow-x:auto;overflow-y:hidden;scrollbar-width:none}
 nav::-webkit-scrollbar{display:none}
-.ntab{display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;color:var(--t2);font-family:var(--dm);padding:0 12px;cursor:pointer;height:100%;border-radius:13px;transition:all .2s;white-space:nowrap;user-select:none;letter-spacing:.01em;flex-shrink:0}
+.ntab{display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;color:var(--t2);font-family:var(--dm);padding:0 14px;cursor:pointer;height:100%;border-radius:13px;transition:all .2s;white-space:nowrap;user-select:none;letter-spacing:.01em;flex-shrink:0;position:relative}
 .ntab svg{width:13px;height:13px;flex-shrink:0}
 .ntab:hover{color:var(--txt);background:rgba(255,255,255,.6)}
-.ntab.on{color:var(--txt);background:#fff;box-shadow:0 6px 18px rgba(21,34,53,.08)}
+.ntab.on{color:var(--cy);background:var(--cy3);box-shadow:0 4px 14px rgba(36,84,215,.10)}
+.ntab.on::after{content:'';position:absolute;bottom:4px;left:50%;transform:translateX(-50%);width:18px;height:2px;border-radius:999px;background:var(--cy)}
 .nbadge{font-size:9px;font-weight:700;letter-spacing:.04em;background:var(--red2);color:var(--red);border:1px solid rgba(196,75,64,.18);border-radius:999px;padding:1px 5px;display:none;font-family:var(--mono);line-height:1.4;margin-left:2px}
 .nbadge.show{display:inline}
 
@@ -324,7 +411,7 @@ nav::-webkit-scrollbar{display:none}
 .dz-title span{color:var(--cy)}
 .dz-sub{font-size:15px;color:var(--t2);text-align:center;line-height:1.75;max-width:560px}
 .dz-formats{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
-.dz-fmt{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.08em;background:#fff;border:1px solid var(--bord);border-radius:999px;padding:7px 10px;color:var(--t2)}
+.dz-fmt{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.08em;background:var(--bg2);border:1px solid var(--bord);border-radius:999px;padding:7px 10px;color:var(--t2)}
 .dz-btn{display:flex;align-items:center;gap:8px;background:linear-gradient(135deg,#1949d8,#5a81f4);color:#fff;font-family:var(--dm);font-size:13px;font-weight:700;border:none;border-radius:999px;padding:12px 24px;cursor:pointer;transition:all .2s;letter-spacing:.01em;box-shadow:0 16px 34px rgba(36,84,215,.20)}
 .dz-btn:hover{transform:translateY(-1px);box-shadow:0 20px 42px rgba(36,84,215,.24)}
 .dz-btn svg{width:14px;height:14px}
@@ -334,8 +421,8 @@ nav::-webkit-scrollbar{display:none}
 .uhint svg{width:13px;height:13px;color:var(--cy);opacity:.8}
 
 /* SCAN OVERLAY */
-#scan-overlay{position:fixed;inset:0;z-index:500;background:rgba(18,28,42,.34);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:none;flex-direction:column;align-items:center;justify-content:center;gap:0;padding:40px 20px}
-#scan-overlay.vis{display:flex}
+#scan-overlay{position:fixed;inset:0;z-index:500;background:rgba(18,28,42,.34);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:none;flex-direction:column;align-items:center;justify-content:center;gap:0;padding:40px 20px;opacity:0;transition:opacity .3s}
+#scan-overlay.vis{display:flex;opacity:1}
 .sc-top{display:flex;flex-direction:column;align-items:center;gap:12px;margin-bottom:28px}
 .sc-badge{font-family:var(--mono);font-size:10px;letter-spacing:.18em;font-weight:600;color:var(--cy);text-transform:uppercase;background:rgba(255,255,255,.78);border:1px solid rgba(36,84,215,.16);border-radius:999px;padding:8px 12px}
 .sc-filename{font-family:var(--mono);font-size:13px;color:#eef4ff;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -358,9 +445,16 @@ nav::-webkit-scrollbar{display:none}
 .sc-stage:last-child{border-bottom:none}
 .sc-stage.done{color:var(--t2)}.sc-stage.done .ss-dot{background:var(--grn);border-color:var(--grn)}.sc-stage.done .ss-dot::after{display:block}
 .sc-stage.active{color:var(--cy)}.sc-stage.active .ss-dot{background:var(--cy);border-color:var(--cy)}
-.ss-dot{width:10px;height:10px;border-radius:50%;border:1.5px solid #d8e0ea;background:#fff;flex-shrink:0;position:relative;transition:all .3s}
+.ss-dot{width:10px;height:10px;border-radius:50%;border:1.5px solid var(--bord4,#d8e0ea);background:var(--bg2);flex-shrink:0;position:relative;transition:all .3s}
 .ss-dot::after{content:'✓';display:none;position:absolute;font-size:7px;color:#fff;top:50%;left:50%;transform:translate(-50%,-50%)}
 .ss-lbl{flex:1}.ss-time{font-size:9px;color:var(--t3);letter-spacing:.04em}
+/* Score track uses neutral grey that works in both modes */
+.score-track{height:6px;border-radius:999px;background:var(--bg3);overflow:hidden;margin-top:4px}
+.score-fill{height:100%;width:0%;border-radius:999px;transition:width .8s cubic-bezier(.4,0,.2,1) .3s}
+/* Table details button — no hover lift */
+.hbtn-sm{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:5px 10px;border-radius:999px;cursor:pointer;transition:background .15s,color .15s;border:1px solid var(--bord);background:var(--bg2);color:var(--t2);font-family:var(--dm);white-space:nowrap}
+.hbtn-sm:hover{background:var(--cy2);color:var(--cy);border-color:var(--bord2)}
+.hbtn-sm svg{width:11px;height:11px;flex-shrink:0}
 
 /* VIEW HEADER */
 .vh{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;flex-wrap:wrap}
@@ -372,11 +466,18 @@ nav::-webkit-scrollbar{display:none}
 /* KPI GRID */
 .kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
 @media(max-width:900px){.kpi-grid{grid-template-columns:repeat(2,1fr)}}
-.kpi-card{background:rgba(255,255,255,.82);border:1px solid var(--bord);border-radius:24px;padding:24px;position:relative;overflow:hidden;transition:border-color .2s,transform .15s,box-shadow .2s;animation:card-in .4s ease both;box-shadow:0 18px 40px rgba(21,34,53,.08)}
+.kpi-card{background:var(--bg2);border:1px solid var(--bord);border-radius:24px;padding:24px;position:relative;overflow:hidden;transition:border-color .2s,transform .15s,box-shadow .2s;animation:card-in .4s ease both;box-shadow:0 18px 40px rgba(21,34,53,.08)}
 .kpi-card:nth-child(1){animation-delay:.05s}.kpi-card:nth-child(2){animation-delay:.1s}.kpi-card:nth-child(3){animation-delay:.15s}.kpi-card:nth-child(4){animation-delay:.2s}
 @keyframes card-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 .kpi-card:hover{border-color:rgba(21,34,53,.16);transform:translateY(-2px);box-shadow:0 24px 48px rgba(21,34,53,.10)}
 .kpi-card::before{content:'';position:absolute;top:0;left:24px;right:24px;height:1px;background:linear-gradient(90deg,transparent,rgba(36,84,215,.18),transparent)}
+.kpi-card.red::before{background:linear-gradient(90deg,transparent,rgba(196,75,64,.24),transparent)}
+.kpi-card.amb::before{background:linear-gradient(90deg,transparent,rgba(199,122,24,.24),transparent)}
+.kpi-card.grn::before{background:linear-gradient(90deg,transparent,rgba(46,122,84,.24),transparent)}
+/* Compact stat cards in live/tunnel views — override hover lift + shimmer */
+#live-stats-row .kpi-card,#tunnel-summary-cards .kpi-card{animation:none;overflow:visible}
+#live-stats-row .kpi-card:hover,#tunnel-summary-cards .kpi-card:hover{transform:none}
+#live-stats-row .kpi-card::before,#tunnel-summary-cards .kpi-card::before{display:none}
 .kpi-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
 .kpi-icon{width:42px;height:42px;border-radius:14px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .kpi-icon svg{width:18px;height:18px}
@@ -393,19 +494,19 @@ nav::-webkit-scrollbar{display:none}
 /* OVERVIEW GRID */
 .ov-grid{display:grid;grid-template-columns:1.35fr .95fr;gap:16px}
 @media(max-width:1100px){.ov-grid{grid-template-columns:1fr}}
-.ov-card{background:rgba(255,255,255,.84);border:1px solid var(--bord);border-radius:24px;padding:24px;box-shadow:0 18px 40px rgba(21,34,53,.08);display:flex;flex-direction:column;gap:18px;min-height:100%}
+.ov-card{background:var(--bg2);border:1px solid var(--bord);border-radius:24px;padding:24px;box-shadow:0 18px 40px rgba(21,34,53,.08);display:flex;flex-direction:column;gap:18px;min-height:100%}
 .ov-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}
 .ov-card-title{font-family:var(--syne);font-size:18px;font-weight:700;color:var(--txt);letter-spacing:-.03em}
 .ov-card-sub{font-size:13px;color:var(--t2);line-height:1.7;max-width:58ch}
-.assess-chip{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:999px;font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:1px solid var(--bord);background:#fff;color:var(--t2)}
-.assess-chip.critical{background:var(--red3);border-color:rgba(196,75,64,.18);color:var(--red)}
-.assess-chip.warn{background:var(--amb3);border-color:rgba(199,122,24,.18);color:var(--amb)}
+.assess-chip{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:999px;font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:1px solid var(--bord);background:var(--bg2);color:var(--t2)}
+.assess-chip.critical{background:var(--red2);border-color:rgba(196,75,64,.22);color:var(--red)}
+.assess-chip.warn{background:var(--amb2);border-color:rgba(199,122,24,.22);color:var(--amb)}
 .assess-chip.ok{background:var(--grn3);border-color:rgba(46,122,84,.18);color:var(--grn)}
 .assess-chip svg{width:12px;height:12px}
 .assess-body{font-size:24px;line-height:1.2;font-weight:800;letter-spacing:-.04em;color:var(--txt);max-width:24ch}
 .assess-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
 @media(max-width:720px){.assess-meta{grid-template-columns:repeat(2,minmax(0,1fr))}}
-.assess-stat{background:linear-gradient(180deg,rgba(255,255,255,.95),rgba(244,239,230,.86));border:1px solid var(--bord);border-radius:18px;padding:14px 16px;display:flex;flex-direction:column;gap:4px}
+.assess-stat{background:var(--bg2);border:1px solid var(--bord);border-radius:18px;padding:14px 16px;display:flex;flex-direction:column;gap:4px}
 .assess-stat-label{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--t3)}
 .assess-stat-value{font-family:var(--syne);font-size:22px;font-weight:700;letter-spacing:-.04em;color:var(--txt)}
 .assess-points{display:grid;gap:10px}
@@ -414,21 +515,21 @@ nav::-webkit-scrollbar{display:none}
 .assess-actions{display:flex;gap:10px;flex-wrap:wrap}
 .mini-grid{display:grid;grid-template-columns:1fr;gap:14px}
 .mini-list{display:grid;gap:10px}
-.mini-item{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 15px;border-radius:18px;border:1px solid var(--bord);background:linear-gradient(180deg,rgba(255,255,255,.95),rgba(245,240,232,.86))}
+.mini-item{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 15px;border-radius:18px;border:1px solid var(--bord);background:var(--bg2)}
 .mini-main{min-width:0;display:flex;flex-direction:column;gap:5px}
 .mini-kicker{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--t3)}
 .mini-title{font-size:13px;font-weight:700;color:var(--txt);line-height:1.5;word-break:break-word}
 .mini-sub{font-size:12px;color:var(--t2);line-height:1.6}
 .mini-side{display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex-shrink:0}
 .mini-score{min-width:48px;text-align:center;padding:8px 10px;border-radius:14px;font-family:var(--syne);font-size:20px;font-weight:700;letter-spacing:-.04em;background:rgba(36,84,215,.08);color:var(--cy)}
-.mini-score.warn{background:var(--amb3);color:var(--amb)}.mini-score.bad{background:var(--red3);color:var(--red)}
-.mini-empty{padding:22px 18px;border:1px dashed rgba(21,34,53,.12);border-radius:18px;text-align:center;font-size:13px;color:var(--t3);background:rgba(255,255,255,.55)}
+.mini-score.warn{background:var(--amb2);color:var(--amb)}.mini-score.bad{background:var(--red2);color:var(--red)}
+.mini-empty{padding:22px 18px;border:1px dashed rgba(21,34,53,.12);border-radius:18px;text-align:center;font-size:13px;color:var(--t3);background:var(--bg2)}
 
 /* CHART GRID */
 .chart-row{display:grid;gap:16px}
 .chart-row.r2{grid-template-columns:2fr 1fr}.chart-row.r3{grid-template-columns:1fr 1fr 1fr}
 @media(max-width:800px){.chart-row.r2,.chart-row.r3{grid-template-columns:1fr}}
-.chart-card{background:rgba(255,255,255,.82);border:1px solid var(--bord);border-radius:24px;padding:24px;display:flex;flex-direction:column;gap:16px;animation:card-in .4s ease .25s both;box-shadow:0 18px 40px rgba(21,34,53,.08)}
+.chart-card{background:var(--bg2);border:1px solid var(--bord);border-radius:24px;padding:24px;display:flex;flex-direction:column;gap:16px;animation:card-in .4s ease .25s both;box-shadow:0 18px 40px rgba(21,34,53,.08)}
 .cc-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .cc-title{font-family:var(--syne);font-size:15px;font-weight:700;color:var(--txt);letter-spacing:-.03em}
 .cc-sub{font-size:11px;color:var(--t3);font-family:var(--mono)}
@@ -437,19 +538,19 @@ nav::-webkit-scrollbar{display:none}
 .chart-wrap.tall{height:220px}.chart-wrap.short{height:170px}.chart-wrap.donut{height:220px;display:flex;align-items:center;justify-content:center}
 
 /* ALERTS TABLE */
-.tbl-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:rgba(255,255,255,.82);border:1px solid var(--bord);border-radius:24px;padding:14px 18px;box-shadow:0 18px 40px rgba(21,34,53,.08)}
+.tbl-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--bg2);border:1px solid var(--bord);border-radius:24px;padding:14px 18px;box-shadow:0 18px 40px rgba(21,34,53,.08)}
 .srch-wrap{position:relative;flex:1;min-width:180px}
 .srch-wrap svg{position:absolute;left:14px;top:50%;transform:translateY(-50%);width:15px;height:15px;color:var(--t2);pointer-events:none}
-#qsrch{width:100%;background:#fff;border:1px solid var(--bord);border-radius:18px;padding:12px 14px 12px 42px;font-size:13px;color:var(--txt);font-family:var(--dm);transition:border-color .2s;outline:none}
+#qsrch{width:100%;background:var(--bg1);border:1px solid var(--bord);border-radius:18px;padding:12px 14px 12px 42px;font-size:13px;color:var(--txt);font-family:var(--dm);transition:border-color .2s;outline:none}
 #qsrch::placeholder{color:var(--t3)}
 #qsrch:focus{border-color:var(--bord3);box-shadow:0 0 0 4px rgba(36,84,215,.08)}
-.filt-btn{display:flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:10px 12px;border-radius:999px;cursor:pointer;border:1px solid var(--bord);background:#fff;color:var(--t2);font-family:var(--dm);transition:all .15s;white-space:nowrap}
+.filt-btn{display:flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:10px 12px;border-radius:999px;cursor:pointer;border:1px solid var(--bord);background:var(--bg2);color:var(--t2);font-family:var(--dm);transition:all .15s;white-space:nowrap}
 .filt-btn:hover{border-color:rgba(21,34,53,.16);color:var(--txt)}.filt-btn.on{background:var(--cy2);border-color:rgba(36,84,215,.18);color:var(--txt)}
 .filt-btn svg{width:11px;height:11px}
 .tbl-info{font-family:var(--mono);font-size:10px;color:var(--t3);margin-left:auto}
 .tbl-wrap{background:rgba(255,255,255,.82);border:1px solid var(--bord);border-radius:24px;overflow:hidden;box-shadow:0 18px 40px rgba(21,34,53,.08)}
 .atbl{width:100%;border-collapse:collapse}
-.atbl thead{background:rgba(255,255,255,.72)}
+.atbl thead{background:var(--bg2)}
 .atbl th{padding:14px 16px;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);text-align:left;font-family:var(--mono);border-bottom:1px solid var(--bord);white-space:nowrap;cursor:pointer;user-select:none;transition:color .15s}
 .atbl th:hover{color:var(--t2)}.atbl th svg{display:inline;width:10px;height:10px;margin-left:3px}
 .atbl tbody tr{border-bottom:1px solid var(--bord);cursor:pointer;transition:background .12s}
@@ -458,7 +559,7 @@ nav::-webkit-scrollbar{display:none}
 .td-query{font-family:var(--mono);font-size:11px;color:var(--txt);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .td-sub{font-family:var(--mono);font-size:11px;color:var(--cy);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 .td-ip{font-family:var(--mono);font-size:11px;color:var(--t2)}
-.td-type{font-family:var(--mono);font-size:10px;font-weight:500;background:#fff;border:1px solid var(--bord);border-radius:999px;padding:5px 8px;color:var(--t2);display:inline-block}
+.td-type{font-family:var(--mono);font-size:10px;font-weight:500;background:var(--bg2);border:1px solid var(--bord);border-radius:999px;padding:5px 8px;color:var(--t2);display:inline-block}
 .td-type.special{background:var(--amb2);border-color:rgba(199,122,24,.18);color:var(--amb)}
 .risk-badge{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.04em;border-radius:999px;padding:6px 10px;white-space:nowrap}
 .risk-badge.hi{background:var(--red2);color:var(--red);border:1px solid rgba(196,75,64,.18)}
@@ -472,7 +573,7 @@ nav::-webkit-scrollbar{display:none}
 
 /* HOSTS VIEW */
 .host-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px}
-.host-card{background:rgba(255,255,255,.82);border:1px solid var(--bord);border-radius:24px;padding:22px;display:flex;flex-direction:column;gap:14px;transition:border-color .2s,transform .15s,box-shadow .2s;box-shadow:0 18px 40px rgba(21,34,53,.08)}
+.host-card{background:var(--bg2);border:1px solid var(--bord);border-radius:24px;padding:22px;display:flex;flex-direction:column;gap:14px;transition:border-color .2s,transform .15s,box-shadow .2s;box-shadow:0 18px 40px rgba(21,34,53,.08)}
 .host-card:hover{border-color:rgba(21,34,53,.16);transform:translateY(-2px);box-shadow:0 22px 48px rgba(21,34,53,.10)}
 .hc-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .hc-ip{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--txt)}
@@ -483,15 +584,15 @@ nav::-webkit-scrollbar{display:none}
 .hc-bar-label span:last-child{color:var(--t2);font-family:var(--mono)}
 .hc-bar{height:6px;border-radius:999px;background:#e9edf3;overflow:hidden}
 .hc-bar-fill{height:100%;border-radius:999px}
-.hc-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;border:1px solid var(--bord);border-radius:18px;overflow:hidden;background:#fff}
+.hc-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;border:1px solid var(--bord);border-radius:18px;overflow:hidden;background:var(--bg2)}
 .hc-stat{padding:10px;text-align:center;border-right:1px solid var(--bord)}
 .hc-stat:last-child{border-right:none}
 .hc-stat-num{font-family:var(--syne);font-size:18px;font-weight:700}
 .hc-stat-lbl{font-size:9px;color:var(--t3);font-family:var(--mono);letter-spacing:.08em;margin-top:3px}
 .hc-feat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:4px}
 .hc-feat{background:rgba(36,84,215,.04);border:1px solid rgba(36,84,215,.08);border-radius:14px;padding:10px 12px;display:flex;flex-direction:column;gap:3px}
-.hc-feat.warn{background:var(--amb3);border-color:rgba(199,122,24,.12)}
-.hc-feat.danger{background:var(--red3);border-color:rgba(196,75,64,.12)}
+.hc-feat.warn{background:var(--amb2);border-color:rgba(199,122,24,.20)}
+.hc-feat.danger{background:var(--red2);border-color:rgba(196,75,64,.20)}
 .hc-feat-num{font-family:var(--syne);font-size:16px;font-weight:700;color:var(--txt)}
 .hc-feat-lbl{font-size:9px;color:var(--t3);font-family:var(--mono);letter-spacing:.06em;line-height:1.3}
 .hc-divider{height:1px;background:var(--bord);margin:2px 0}
@@ -500,7 +601,7 @@ nav::-webkit-scrollbar{display:none}
 .feat-row{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
 @media(max-width:900px){.feat-row{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:600px){.feat-row{grid-template-columns:1fr}}
-.feat-stat-card{background:rgba(255,255,255,.82);border:1px solid var(--bord);border-radius:20px;padding:20px;box-shadow:0 12px 30px rgba(21,34,53,.07);display:flex;flex-direction:column;gap:10px}
+.feat-stat-card{background:var(--bg2);border:1px solid var(--bord);border-radius:20px;padding:20px;box-shadow:0 12px 30px rgba(21,34,53,.07);display:flex;flex-direction:column;gap:10px}
 .feat-stat-head{display:flex;align-items:center;justify-content:space-between}
 .feat-stat-label{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--t3)}
 .feat-stat-icon{width:32px;height:32px;border-radius:10px;display:flex;align-items:center;justify-content:center}
@@ -512,11 +613,11 @@ nav::-webkit-scrollbar{display:none}
 .feat-thresh-marker{position:absolute;top:-2px;bottom:-2px;width:2px;border-radius:2px;background:var(--t3);opacity:.5}
 
 /* THRESHOLD TABLE */
-.thresh-summary{background:rgba(255,255,255,.82);border:1px solid var(--bord);border-radius:24px;overflow:hidden;box-shadow:0 18px 40px rgba(21,34,53,.08)}
+.thresh-summary{background:var(--bg2);border:1px solid var(--bord);border-radius:24px;overflow:hidden;box-shadow:0 18px 40px rgba(21,34,53,.08)}
 .thresh-summary-head{padding:20px 24px;border-bottom:1px solid var(--bord);display:flex;align-items:center;justify-content:space-between}
 .thresh-summary-title{font-family:var(--syne);font-size:16px;font-weight:700;color:var(--txt);letter-spacing:-.02em}
 .thresh-tbl{width:100%;border-collapse:collapse}
-.thresh-tbl th{padding:12px 20px;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);text-align:left;font-family:var(--mono);border-bottom:1px solid var(--bord);background:rgba(255,255,255,.5)}
+.thresh-tbl th{padding:12px 20px;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);text-align:left;font-family:var(--mono);border-bottom:1px solid var(--bord);background:var(--bg2)}
 .thresh-tbl td{padding:14px 20px;font-size:12px;border-bottom:1px solid var(--bord)}
 .thresh-tbl tr:last-child td{border-bottom:none}
 .thresh-tbl tr:hover td{background:rgba(36,84,215,.03)}
@@ -531,7 +632,7 @@ nav::-webkit-scrollbar{display:none}
 /* SETTINGS VIEW */
 .settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
 @media(max-width:700px){.settings-grid{grid-template-columns:1fr}}
-.set-card{background:rgba(255,255,255,.82);border:1px solid var(--bord);border-radius:24px;padding:24px;display:flex;flex-direction:column;gap:16px;box-shadow:0 18px 40px rgba(21,34,53,.08)}
+.set-card{background:var(--bg2);border:1px solid var(--bord);border-radius:24px;padding:24px;display:flex;flex-direction:column;gap:16px;box-shadow:0 18px 40px rgba(21,34,53,.08)}
 .set-card.full{grid-column:1/-1}
 .set-card-title{font-family:var(--syne);font-size:15px;font-weight:700;color:var(--txt);display:flex;align-items:center;gap:8px;letter-spacing:-.02em}
 .set-card-title svg{width:15px;height:15px;color:var(--cy)}
@@ -547,7 +648,7 @@ nav::-webkit-scrollbar{display:none}
 .mth-dot svg{width:14px;height:14px}
 .mth-key{font-size:13px;font-weight:700;color:var(--txt);margin-bottom:4px}
 .mth-val{font-size:12px;color:var(--t2);line-height:1.65}
-.score-formula{background:#fff;border:1px solid var(--bord2);border-radius:18px;padding:14px 16px;font-family:var(--mono);font-size:12px;color:var(--cy);display:flex;gap:12px;align-items:center}
+.score-formula{background:var(--bg2);border:1px solid var(--bord2);border-radius:18px;padding:14px 16px;font-family:var(--mono);font-size:12px;color:var(--cy);display:flex;gap:12px;align-items:center}
 .sf-part{display:flex;flex-direction:column;gap:2px}
 .sf-part span:first-child{font-size:18px;font-weight:700;font-family:var(--syne)}
 .sf-part span:last-child{font-size:9px;color:var(--t3);letter-spacing:.08em}
@@ -563,7 +664,7 @@ nav::-webkit-scrollbar{display:none}
 .drw-hdr-info{flex:1;min-width:0}
 .drw-query-text{font-family:var(--mono);font-size:12px;color:var(--txt);word-break:break-all;line-height:1.6}
 .drw-query-sub{font-size:11px;color:var(--t3);margin-top:4px;font-family:var(--mono)}
-.drw-close{width:34px;height:34px;border-radius:999px;border:1px solid var(--bord);background:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;color:var(--t2);transition:all .15s}
+.drw-close{width:34px;height:34px;border-radius:999px;border:1px solid var(--bord);background:var(--bg2);display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;color:var(--t2);transition:all .15s}
 .drw-close:hover{background:var(--cy3);color:var(--txt)}
 .drw-close svg{width:13px;height:13px}
 #drw-body{flex:1;overflow-y:auto;padding:0 22px 28px}
@@ -597,13 +698,13 @@ nav::-webkit-scrollbar{display:none}
 .no-rules{font-size:12px;color:var(--t3);font-style:italic;padding:6px 0}
 .subdomain-pill{display:inline-block;font-family:var(--mono);font-size:11px;background:var(--cy2);border:1px solid var(--bord2);border-radius:10px;padding:6px 10px;color:var(--cy);word-break:break-all;line-height:1.5;margin-top:4px;max-width:100%}
 .mini-score-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px}
-.mscore-box{background:#fff;border:1px solid var(--bord);border-radius:14px;padding:12px 14px;display:flex;flex-direction:column;gap:3px}
+.mscore-box{background:var(--bg2);border:1px solid var(--bord);border-radius:14px;padding:12px 14px;display:flex;flex-direction:column;gap:3px}
 .mscore-val{font-family:var(--syne);font-size:20px;font-weight:700;color:var(--txt)}
 .mscore-lbl{font-size:10px;color:var(--t3);font-family:var(--mono);letter-spacing:.06em}
 
 /* TOAST */
 #toasts{position:fixed;bottom:20px;right:20px;z-index:1000;display:flex;flex-direction:column;gap:10px;align-items:flex-end}
-.toast{display:flex;align-items:center;gap:8px;background:rgba(255,255,255,.94);border:1px solid var(--bord);border-radius:18px;padding:12px 14px;font-size:12px;color:var(--txt);box-shadow:0 16px 34px rgba(21,34,53,.12);animation:toastin .2s ease;font-family:var(--dm)}
+.toast{display:flex;align-items:center;gap:8px;background:var(--bg1);border:1px solid var(--bord);border-radius:18px;padding:12px 14px;font-size:12px;color:var(--txt);box-shadow:0 16px 34px rgba(21,34,53,.12);animation:toastin .2s ease;font-family:var(--dm)}
 @keyframes toastin{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:translateX(0)}}
 .toast.warn{border-color:rgba(199,122,24,.18)}
 .t-icon{width:20px;height:20px;border-radius:999px;display:flex;align-items:center;justify-content:center;background:var(--grn2);color:var(--grn);flex-shrink:0}
@@ -621,13 +722,11 @@ nav::-webkit-scrollbar{display:none}
 .leg-item{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--t2)}
 .leg-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 
-/* DARK MODE */
+/* DARK MODE TOGGLE — extends .hbtn, only adds user-select */
 .dark-toggle{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:700;padding:10px 15px;border-radius:999px;cursor:pointer;transition:all .16s;border:1px solid var(--bord);background:rgba(255,255,255,.86);color:var(--txt);font-family:var(--dm);white-space:nowrap;user-select:none}
 .dark-toggle:hover{transform:translateY(-1px);border-color:rgba(21,34,53,.18);box-shadow:0 10px 22px rgba(21,34,53,.08)}
 .dark-toggle svg{width:14px;height:14px;flex-shrink:0}
-body.dark{color-scheme:dark}
-body.dark{--bg:#0e1420;--bg1:#131926;--bg2:rgba(19,25,38,.92);--bg3:#1a2135;--bg4:#222d44;--bord:rgba(255,255,255,.08);--bord2:rgba(99,149,255,.22);--bord3:rgba(99,149,255,.35);--txt:#e8edf5;--t2:#8d9ab0;--t3:#5a6680;--cy:#6395ff;--cy2:rgba(99,149,255,.14);--cy3:rgba(99,149,255,.08);--cy4:rgba(99,149,255,.04);--red:#f07068;--red2:rgba(240,112,104,.18);--red3:rgba(240,112,104,.08);--grn:#4ead7a;--grn2:rgba(78,173,122,.16);--grn3:rgba(78,173,122,.07);--amb:#e8952a;--amb2:rgba(232,149,42,.18);--amb3:rgba(232,149,42,.08);--pur:#a97bf5;--pur2:rgba(169,123,245,.16);--pur3:rgba(169,123,245,.08)}
-body.dark{background:radial-gradient(circle at 0% 0%,rgba(99,149,255,.09),transparent 24%),radial-gradient(circle at 92% 10%,rgba(240,112,104,.06),transparent 22%),linear-gradient(180deg,#0e1420 0%,#0b111c 100%)}
+body.dark{color-scheme:dark;--bg:#0e1420;--bg1:#131926;--bg2:rgba(19,25,38,.92);--bg3:#1a2135;--bg4:#222d44;--bord:rgba(255,255,255,.08);--bord2:rgba(99,149,255,.22);--bord3:rgba(99,149,255,.35);--bord4:rgba(255,255,255,.14);--txt:#e8edf5;--t2:#8d9ab0;--t3:#5a6680;--cy:#6395ff;--cy2:rgba(99,149,255,.14);--cy3:rgba(99,149,255,.08);--cy4:rgba(99,149,255,.04);--red:#f07068;--red2:rgba(240,112,104,.18);--red3:rgba(240,112,104,.10);--grn:#4ead7a;--grn2:rgba(78,173,122,.16);--grn3:rgba(78,173,122,.09);--amb:#e8952a;--amb2:rgba(232,149,42,.18);--amb3:rgba(232,149,42,.10);--pur:#a97bf5;--pur2:rgba(169,123,245,.16);--pur3:rgba(169,123,245,.10);background:radial-gradient(circle at 0% 0%,rgba(99,149,255,.09),transparent 24%),radial-gradient(circle at 92% 10%,rgba(240,112,104,.06),transparent 22%),linear-gradient(180deg,#0e1420 0%,#0b111c 100%)}
 body.dark header,body.dark nav{background:rgba(19,25,38,.82)}
 body.dark .ov-card,body.dark .chart-card,body.dark .kpi-card,body.dark .tbl-wrap,body.dark .sc-center,body.dark .drop-zone{background:rgba(19,25,38,.92);border-color:var(--bord)}
 body.dark .ntab.on{background:rgba(255,255,255,.06)}
@@ -638,51 +737,45 @@ body.dark .atbl tbody tr:hover{background:rgba(99,149,255,.06)}
 body.dark #drawer{background:var(--bg1)}
 body.dark .mscore-box,body.dark .kv{background:rgba(255,255,255,.03)}
 body.dark input[type=text]{background:rgba(255,255,255,.06);color:var(--txt);border-color:var(--bord)}
-body.dark .set-card{background:rgba(19,25,38,.92);border-color:var(--bord)}
-body.dark .filt-btn{background:rgba(255,255,255,.06);color:var(--t2);border-color:var(--bord)}
+body.dark .set-card{border-color:var(--bord)}
+body.dark .filt-btn{color:var(--t2);border-color:var(--bord)}
 body.dark .filt-btn.on{background:var(--cy2);color:var(--txt)}
-body.dark .assess-chip{background:rgba(255,255,255,.05);border-color:var(--bord)}
-body.dark .score-formula{background:rgba(255,255,255,.04);border-color:var(--bord2)}
-body.dark #qsrch{background:rgba(255,255,255,.06);color:var(--txt);border-color:var(--bord)}
-body.dark .td-type{background:rgba(255,255,255,.06);border-color:var(--bord)}
-body.dark .drw-close{background:rgba(255,255,255,.06);border-color:var(--bord)}
-body.dark .dz-fmt{background:rgba(255,255,255,.06);border-color:var(--bord)}
-body.dark .ss-dot{background:var(--bg3);border-color:var(--bord2)}
-body.dark .mini-item{background:rgba(19,25,38,.92);border-color:var(--bord)}
+body.dark #view-live pre{background:var(--bg3) !important;border-color:var(--bord) !important;color:var(--txt) !important}
+body.dark nav::-webkit-scrollbar{display:none}
+body.dark .toast{background:var(--bg1);border-color:var(--bord);color:var(--txt);box-shadow:0 16px 34px rgba(0,0,0,.4)}
+body.dark .tbl-toolbar{background:var(--bg2);border-color:var(--bord)}
+body.dark .feat-stat-card{border-color:var(--bord)}
+body.dark .thresh-summary{border-color:var(--bord)}
+body.dark .thresh-tbl th{background:rgba(255,255,255,.04)}
+body.dark .thresh-tbl tr:hover td{background:rgba(99,149,255,.05)}
+body.dark .assess-stat{border-color:var(--bord)}
+body.dark .mini-item{border-color:var(--bord)}
+body.dark .host-card{border-color:var(--bord)}
+body.dark .mini-empty{background:rgba(255,255,255,.03);border-color:var(--bord);color:var(--t3)}
 
-/* kpi-card compact variant used in Live Feed stats row */
-#live-stats-row .kpi-card{display:flex;align-items:center;gap:14px;padding:18px 20px;animation:none}
-#live-stats-row .kpi-body{display:flex;flex-direction:column;gap:3px;min-width:0}
-#live-stats-row .kpi-val{font-family:var(--syne);font-size:26px;font-weight:800;letter-spacing:-.04em;line-height:1;color:var(--txt)}
-#live-stats-row .kpi-label{font-size:11px;font-weight:700;color:var(--t2);letter-spacing:.01em}
-#live-stats-row .kpi-sub{font-family:var(--mono);font-size:10px;color:var(--t3);margin-top:1px}
-#live-stats-row .kpi-icon{flex-shrink:0;width:42px;height:42px;border-radius:14px;display:flex;align-items:center;justify-content:center}
-#live-stats-row .kpi-icon svg{width:18px;height:18px}
-/* Tunnel summary cards — same compact style */
-#tunnel-summary-cards .kpi-card{display:flex;align-items:center;gap:14px;padding:18px 20px;animation:none}
-#tunnel-summary-cards .kpi-body{display:flex;flex-direction:column;gap:3px;min-width:0}
-#tunnel-summary-cards .kpi-val{font-family:var(--syne);font-size:26px;font-weight:800;letter-spacing:-.04em;line-height:1;color:var(--txt)}
-#tunnel-summary-cards .kpi-label{font-size:11px;font-weight:700;color:var(--t2);letter-spacing:.01em}
-#tunnel-summary-cards .kpi-sub{font-family:var(--mono);font-size:10px;color:var(--t3);margin-top:1px}
-#tunnel-summary-cards .kpi-icon{flex-shrink:0;width:42px;height:42px;border-radius:14px;display:flex;align-items:center;justify-content:center}
-#tunnel-summary-cards .kpi-icon svg{width:18px;height:18px}
+/* kpi-card compact variant — shared by Live Feed stats row and Tunnel summary cards */
+#live-stats-row .kpi-card,#tunnel-summary-cards .kpi-card{display:flex;align-items:center;gap:14px;padding:18px 20px;animation:none}
+#live-stats-row .kpi-body,#tunnel-summary-cards .kpi-body{display:flex;flex-direction:column;gap:3px;min-width:0}
+#live-stats-row .kpi-val,#tunnel-summary-cards .kpi-val{font-family:var(--syne);font-size:26px;font-weight:800;letter-spacing:-.04em;line-height:1;color:var(--txt)}
+#live-stats-row .kpi-label,#tunnel-summary-cards .kpi-label{font-size:11px;font-weight:700;color:var(--t2);letter-spacing:.01em}
+#live-stats-row .kpi-sub,#tunnel-summary-cards .kpi-sub{font-family:var(--mono);font-size:10px;color:var(--t3);margin-top:1px}
+#live-stats-row .kpi-icon,#tunnel-summary-cards .kpi-icon{flex-shrink:0;width:42px;height:42px;border-radius:14px;display:flex;align-items:center;justify-content:center}
+#live-stats-row .kpi-icon svg,#tunnel-summary-cards .kpi-icon svg{width:18px;height:18px}
 
 /* Live Feed event card */
 .live-event-card{background:var(--bg2);border:1px solid var(--bord);border-radius:var(--r8);padding:14px 16px;display:flex;align-items:flex-start;gap:14px;animation:fadein .3s ease;cursor:pointer;transition:box-shadow .15s,border-color .15s}
 .live-event-card:hover{box-shadow:0 6px 18px rgba(21,34,53,.08)}
 body.dark .live-event-card{background:rgba(19,25,38,.92)}
+/* Score badge used inside live event cards */
+.live-score-badge{width:44px;height:44px;display:flex;align-items:center;justify-content:center;border-radius:12px;font-family:var(--syne);font-size:16px;font-weight:800;letter-spacing:-.04em;background:rgba(36,84,215,.08);color:var(--cy)}
+.live-score-badge.warn{background:var(--amb2);color:var(--amb)}
+.live-score-badge.bad{background:var(--red2);color:var(--red)}
 #live-stats-row{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}
 #tunnel-summary-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 @media(max-width:1000px){#live-stats-row{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:640px){#live-stats-row,#tunnel-summary-cards{grid-template-columns:1fr 1fr}}
 body.dark #view-live .kpi-card,
-body.dark #view-tunnels .kpi-card{background:rgba(19,25,38,.92);border-color:var(--bord)}
-body.dark #view-live pre{background:rgba(255,255,255,.04) !important;border-color:var(--bord) !important;color:var(--txt) !important}
-body.dark #live-feed-list > div{background:rgba(19,25,38,.92) !important;border-color:var(--bord) !important}
-body.dark #tunnel-ip-grid > div{background:rgba(19,25,38,.92) !important;border-color:var(--bord) !important}
-body.dark #tunnel-ip-grid [style*="background:#fff"]{background:rgba(255,255,255,.04) !important}
-body.dark #tunnel-ip-grid [style*="background:var(--bg2)"]{background:rgba(19,25,38,.92) !important}
-body.dark nav::-webkit-scrollbar{display:none}
+body.dark #view-tunnels .kpi-card{border-color:var(--bord)}
 </style>
 </head>
 <body>
@@ -699,7 +792,7 @@ body.dark nav::-webkit-scrollbar{display:none}
   <div id="hd-file">no file loaded</div>
   <div class="hd-r">
     <div class="live-pill" id="hd-live-pill" style="display:none"><div class="live-dot"></div>LIVE CAPTURE</div>
-    <div class="live-pill" id="hd-ready-pill"><div class="live-dot" style="background:var(--cy)"></div>READY</div>
+    <div class="live-pill" id="hd-ready-pill"><div class="live-dot"></div>SYSTEM READY</div>
     <div id="hd-ts">--:--:--</div>
     <div class="hd-sep"></div>
     <button class="hbtn" id="btn-new-scan" onclick="resetToUpload()">
@@ -718,7 +811,7 @@ body.dark nav::-webkit-scrollbar{display:none}
 
 <!-- NAV -->
 <nav>
-  <div class="ntab on" data-p="overview">
+  <div class="ntab" data-p="overview">
     <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
     Overview
   </div>
@@ -929,16 +1022,16 @@ body.dark nav::-webkit-scrollbar{display:none}
         <table class="atbl">
           <thead>
             <tr>
-              <th onclick="sortTable('query')">Query Domain <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"/></svg></th>
-              <th onclick="sortTable('subdomain')">Subdomain</th>
-              <th onclick="sortTable('src_ip')">Source IP</th>
-              <th onclick="sortTable('record_type')">Type</th>
-              <th onclick="sortTable('risk_score')">Risk Score <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"/></svg></th>
-              <th>Classification</th>
-              <th onclick="sortTable('subdomain_entropy')">Entropy</th>
-              <th onclick="sortTable('subdomain_length')">Sub Len</th>
-              <th onclick="sortTable('hex_ratio')">Hex %</th>
-              <th>Actions</th>
+              <th onclick="sortTable('query')" title="The full website address the device was trying to look up">Query Domain <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"/></svg></th>
+              <th onclick="sortTable('subdomain')" title="The first part of the query — this is where hidden data is often encoded">Subdomain</th>
+              <th onclick="sortTable('src_ip')" title="IP address of the device that sent this DNS request">Source IP</th>
+              <th onclick="sortTable('record_type')" title="The type of DNS record requested — TXT, NULL and MX are commonly abused for tunneling">Type</th>
+              <th onclick="sortTable('risk_score')" title="Combined threat score from 0 (safe) to 100 (critical). Scores ≥ 50 are flagged as tunnel traffic.">Risk Score <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"/></svg></th>
+              <th title="Final verdict — TUNNEL means the query crossed the detection threshold">Classification</th>
+              <th onclick="sortTable('subdomain_entropy')" title="How random the subdomain looks (0–5). High values suggest encoded data — tunneling tools often produce values above 3.8.">Randomness</th>
+              <th onclick="sortTable('subdomain_length')" title="Character length of the subdomain label. Normal hostnames are short; tunneling tools use very long subdomains (> 45 chars) to carry data.">Sub Length</th>
+              <th onclick="sortTable('hex_ratio')" title="Fraction of subdomain characters that are hexadecimal (0–9, a–f). A high ratio suggests binary data encoded as hex.">Hex Chars %</th>
+              <th title="Click to see the full 27-signal breakdown for this query">Details</th>
             </tr>
           </thead>
           <tbody id="alert-tbody"></tbody>
@@ -958,7 +1051,7 @@ body.dark nav::-webkit-scrollbar{display:none}
         <div class="vh-left">
           <div class="vh-eyebrow">Detector Signals</div>
           <div class="vh-title">Feature Analysis</div>
-          <div class="vh-sub">Deep dive into the 10 ML features and 4 rule-based thresholds used by pcap_detector.py</div>
+          <div class="vh-sub">Deep dive into the 10 machine-learning features and 4 rule-based thresholds used by the detection engine to score every DNS query</div>
         </div>
       </div>
       <!-- Feature stat cards -->
@@ -1017,7 +1110,7 @@ body.dark nav::-webkit-scrollbar{display:none}
         <div class="vh-left">
           <div class="vh-eyebrow">Network Inventory</div>
           <div class="vh-title">Source Hosts</div>
-          <div class="vh-sub">Full behavioral profile per source IP — all per-source features from the detector</div>
+          <div class="vh-sub">Full behavioural profile per source IP — all per-source signals from the detection engine</div>
         </div>
       </div>
       <div class="host-grid" id="host-grid"></div>
@@ -1145,7 +1238,7 @@ threading.Thread(target=_push_to_dashboard,
         <div class="vh-left">
           <div class="vh-eyebrow">Analysis Configuration</div>
           <div class="vh-title">Detection Settings</div>
-          <div class="vh-sub">Thresholds, model parameters, and detection methodology from pcap_detector.py</div>
+          <div class="vh-sub">Thresholds, model parameters, and detection methodology used by the analysis engine</div>
         </div>
       </div>
       <div class="settings-grid">
@@ -1185,7 +1278,7 @@ threading.Thread(target=_push_to_dashboard,
 <!-- SCAN OVERLAY -->
 <div id="scan-overlay">
   <div class="sc-top">
-    <div class="sc-badge">Analysis in progress · DNS Shield</div>
+    <div class="sc-badge">Analysis in progress · DNSGuard</div>
     <div class="sc-filename" id="sc-fname">loading.pcap</div>
   </div>
   <div class="sc-center">
@@ -1241,6 +1334,14 @@ let G = {
   live: { mode:'offline', events:[], tracker:{}, stats:{total:0,high:0,medium:0,low:0,tunnel:0}, version:0, interface:'', started_at:null }
 };
 let _filteredRows = [];
+const MAX_VISIBLE_LIVE_EVENTS = __MAX_VISIBLE_LIVE_EVENTS__;
+
+// ── Risk colour helpers — replace 6+ repeated ternary chains ──────────────────
+function riskCol(s)      { return s>=60?'var(--red)':s>=30?'var(--amb)':'var(--grn)'; }
+function riskBg(s)       { return s>=60?'var(--red2)':s>=30?'var(--amb2)':'var(--grn2)'; }
+function riskCls(s)      { return s>=60?'bad':s>=30?'warn':''; }
+function riskBadgeCls(s) { return s>=60?'hi':s>=30?'med':'lo'; }
+function riskGrad(s)     { return s>=60?'linear-gradient(90deg,var(--red),#ff6680)':s>=30?'linear-gradient(90deg,var(--amb),#ffcc00)':'linear-gradient(90deg,var(--grn),#7fffd4)'; }
 
 // ── Scan stages ───────────────────────────────────────────────────────────────
 const STAGES = [
@@ -1258,24 +1359,23 @@ const STAGES = [
 let _scanTimer = null, _scanStage = 0, _scanStart = 0;
 
 function buildScanStages() {
-  const el = document.getElementById('sc-stages');
-  el.innerHTML = STAGES.slice(0,-1).map((s,i) =>
+  $('sc-stages').innerHTML = STAGES.slice(0,-1).map((s,i) =>
     `<div class="sc-stage" id="ss-${i}"><div class="ss-dot"></div><span class="ss-lbl">${s.msg}</span><span class="ss-time" id="ss-t-${i}"></span></div>`
   ).join('');
 }
 function setScanProgress(pct, msg, sub) {
-  const ring=document.getElementById('sc-ring'), bar=document.getElementById('sc-bar'), num=document.getElementById('sc-pct-num');
+  const ring=$('sc-ring'), bar=$('sc-bar'), num=$('sc-pct-num');
   const circ = 2 * Math.PI * 54;
   ring.style.strokeDashoffset = circ * (1 - pct / 100);
   bar.style.width = pct + '%'; num.textContent = Math.round(pct);
-  if (msg) document.getElementById('sc-msg').textContent = msg;
-  if (sub) document.getElementById('sc-sub').textContent = sub;
+  if (msg) $('sc-msg').textContent = msg;
+  if (sub) $('sc-sub').textContent = sub;
 }
 function advanceScanStage(idx) {
   STAGES.slice(0,-1).forEach((_,i)=>{
-    const el=document.getElementById('ss-'+i); if(!el) return;
+    const el=$('ss-'+i); if(!el) return;
     el.className='sc-stage'+(i<idx?' done':i===idx?' active':'');
-    if(i<idx){ const t=document.getElementById('ss-t-'+i); if(t&&!t.textContent) t.textContent=((Date.now()-_scanStart)/1000).toFixed(1)+'s'; }
+    if(i<idx){ const t=$('ss-t-'+i); if(t&&!t.textContent) t.textContent=((Date.now()-_scanStart)/1000).toFixed(1)+'s'; }
   });
 }
 function startScanAnimation() {
@@ -1284,8 +1384,18 @@ function startScanAnimation() {
   _scanTimer=setTimeout(tick,900);
 }
 function finishScan() { clearTimeout(_scanTimer); const last=STAGES[STAGES.length-1]; setScanProgress(100,last.msg,last.sub); advanceScanStage(STAGES.length); setTimeout(hideScanOverlay,900); }
-function showScanOverlay(name) { document.getElementById('sc-fname').textContent=name; const o=document.getElementById('scan-overlay'); o.style.display='flex'; requestAnimationFrame(()=>o.classList.add('vis')); startScanAnimation(); }
-function hideScanOverlay() { const o=document.getElementById('scan-overlay'); o.classList.remove('vis'); setTimeout(()=>{ o.style.display='none'; },350); }
+function showScanOverlay(name) {
+  $('sc-fname').textContent = name;
+  const o = $('scan-overlay');
+  o.style.display = 'flex';
+  requestAnimationFrame(()=>{ requestAnimationFrame(()=>{ o.classList.add('vis'); }); });
+  startScanAnimation();
+}
+function hideScanOverlay() {
+  const o = $('scan-overlay');
+  o.classList.remove('vis');
+  setTimeout(()=>{ o.style.display='none'; }, 320);
+}
 
 // ── Upload ────────────────────────────────────────────────────────────────────
 const dropZone=document.getElementById('drop-zone'), fileInput=document.getElementById('file-input');
@@ -1306,7 +1416,7 @@ function uploadFile(file) {
   fetch('/analyse',{method:'POST',body:fd})
     .then(async r=>{ const d=await r.json(); if(!r.ok) throw new Error(d.error||`Request failed (${r.status})`); return d; })
     .then(d=>{
-      G.data=normalizeRows(Array.isArray(d)?d:(d.records||d.data||[]));
+      G.data=normalizeRows(Array.isArray(d)?d:(d.data||d.records||[]));
       G.pcap=d.pcap_name||file.name; G.version=d.version||(G.version+1);
       G.thresholds=d.thresholds||{}; G.summary=d.summary||null; G.analytics=null;
       finishScan(); setTimeout(()=>loadDashboard(),100);
@@ -1315,8 +1425,8 @@ function uploadFile(file) {
 }
 function resetToUpload() {
   G.data=null; G.pcap=''; G.version=0; G.thresholds={}; G.summary=null; G.analytics=null;
-  document.getElementById('hd-file').textContent='no file loaded';
-  document.getElementById('hd-file').classList.remove('loaded');
+  $set('hd-file','no file loaded');
+  $('hd-file').classList.remove('loaded');
   showView('upload'); destroyCharts();
 }
 
@@ -1364,8 +1474,9 @@ function normalizeRows(rows) {
   });
 }
 
+const _analyticsCache = new WeakMap();
 function getAnalytics(rows) {
-  if(G.analytics&&G.analytics.rows===rows) return G.analytics;
+  if(_analyticsCache.has(rows)) return _analyticsCache.get(rows);
   const analytics={
     rows, total:rows.length, tunnels:0, hiRisk:0, medRisk:0, loRisk:0, riskSum:0,
     hosts:new Set(), badHosts:new Set(), recordTypes:{}, hostStats:{}, hostCounts:{}, hostTunnelCounts:{},
@@ -1439,7 +1550,7 @@ function getAnalytics(rows) {
   analytics.sortedHosts=Object.entries(analytics.hostStats).sort((a,b)=>b[1].tunnels-a[1].tunnels||b[1].total-a[1].total);
   analytics.topAlerts=rows.slice().sort((a,b)=>(b.prediction==='TUNNEL'?1:0)-(a.prediction==='TUNNEL'?1:0)||b.risk_score-a.risk_score).slice(0,6);
   analytics.clean=Math.max(0,analytics.total-analytics.tunnels);
-  G.analytics=analytics; return analytics;
+  G.analytics=analytics; _analyticsCache.set(rows, analytics); return analytics;
 }
 
 function getOverviewRows(rows) {
@@ -1452,12 +1563,14 @@ function getOverviewRows(rows) {
 // ── Dashboard Load ─────────────────────────────────────────────────────────────
 function loadDashboard() {
   const rows=G.data||[];
+  const activeTab = document.querySelector('.ntab.on')?.dataset.p;
+  const nextView = activeTab && !['upload','live'].includes(activeTab) ? activeTab : 'overview';
   const analytics=getAnalytics(rows);
   const overview=getOverviewRows(rows);
   const overviewAnalytics=overview.rows===rows?analytics:getAnalytics(overview.rows);
-  document.getElementById('hd-file').textContent=G.pcap||'analysis.pcap';
-  document.getElementById('hd-file').classList.add('loaded');
-  showView('overview');
+  $('hd-file').textContent=G.pcap||'analysis.pcap';
+  $('hd-file').classList.add('loaded');
+  showView(nextView);
   renderKPIs(analytics);
   renderOverviewInsights(analytics,overviewAnalytics,overview);
   renderCharts(overviewAnalytics,overview);
@@ -1474,13 +1587,13 @@ function loadDashboard() {
 function renderKPIs(analytics) {
   const {total,tunnels,hiRisk,avgRisk}=analytics;
   $set('kpi-total',fmt(total)); $set('kpi-tunnel',fmt(tunnels)); $set('kpi-risk',avgRisk); $set('kpi-hosts',analytics.hostCount);
-  $set('kpi-total-sub',total?`${((total-tunnels)/total*100).toFixed(1)}% clean traffic`:'—');
-  $set('kpi-tunnel-sub',total?`${(tunnels/total*100).toFixed(1)}% of all queries`:'—');
-  $set('kpi-risk-sub',`${hiRisk} queries scored ≥ 60`);
-  $set('kpi-hosts-sub',`${analytics.badHostCount} flagged suspicious`);
+  $set('kpi-total-sub',total?`${((total-tunnels)/total*100).toFixed(1)}% looked normal`:'—');
+  $set('kpi-tunnel-sub',total?`${(tunnels/total*100).toFixed(1)}% of all queries flagged`:'—');
+  $set('kpi-risk-sub',`${hiRisk} queries scored ≥ 60 (high risk)`);
+  $set('kpi-hosts-sub',`${analytics.badHostCount} device${analytics.badHostCount!==1?'s':''} flagged suspicious`);
   $set('kpi-delta-total',total.toLocaleString());
   $set('kpi-delta-tunnel',tunnels?`${tunnels} flagged`:'No flags');
-  document.getElementById('kpi-delta-tunnel').className='kpi-delta '+(tunnels?'up':'ok');
+  $('kpi-delta-tunnel').className='kpi-delta '+(tunnels?'up':'ok');
   $set('kpi-delta-risk',avgRisk+'/100'); $set('kpi-delta-hosts',analytics.hostCount+' IPs');
   $set('ov-sub',`Analysed ${G.pcap} · ${new Date().toLocaleString()}`);
 }
@@ -1489,7 +1602,7 @@ function renderOverviewInsights(analytics,overviewAnalytics,overview) {
   const modeLabel=overview.label;
   const threshold=(G.summary&&G.summary.tunnel_threshold)||50;
   const tunnelRatio=analytics.total?(analytics.tunnels/analytics.total):0;
-  const ovBtn=document.getElementById('ov-mode-btn');
+  const ovBtn=$('ov-mode-btn');
   if(ovBtn){ const isTunnel=G.overviewMode==='tunnel'; ovBtn.classList.toggle('on',isTunnel); ovBtn.innerHTML=`<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>${isTunnel?'Tunnels Only':'All Traffic'}`; }
 
   let state='ok',title='Likely clean traffic posture',summary='No strong tunnel indicators were found in this capture. The dashboard remains available for manual review and host-by-host inspection.';
@@ -1517,10 +1630,10 @@ function renderOverviewInsights(analytics,overviewAnalytics,overview) {
   if(alertWrap){
     const alertRows=overviewAnalytics.topAlerts.slice(0,4);
     alertWrap.innerHTML=alertRows.length?alertRows.map(row=>{
-      const score=+row.risk_score||0, scoreCls=score>=60?'bad':score>=30?'warn':'';
+      const score=+row.risk_score||0, sCoreCls=riskCls(score);
       const reason=Array.isArray(row.rule_reasons)&&row.rule_reasons.length?row.rule_reasons[0]:row.prediction==='TUNNEL'?'Elevated by the combined rule and anomaly score.':'Visible in this overview for analyst review.';
-      const ds=encodeURIComponent(JSON.stringify(row));
-      return `<div class="mini-item" onclick="openDrawer('${ds}')" style="cursor:pointer"><div class="mini-main"><div class="mini-kicker">${esc(row.src_ip||'Unknown')} · ${esc(row.record_type||'DNS')}</div><div class="mini-title">${esc(row.query||'Unknown query')}</div><div class="mini-sub">${esc(reason)}</div></div><div class="mini-side"><div class="mini-score ${scoreCls}">${score}</div><span class="risk-badge ${row.prediction==='TUNNEL'?'hi':score>=60?'hi':score>=30?'med':'lo'}">${row.prediction==='TUNNEL'?'Tunnel':row.risk_level||'Review'}</span></div></div>`;
+      const ds=encodeURIComponent(JSON.stringify(row)).replace(/'/g,'%27');
+      return `<div class="mini-item" onclick="openDrawer('${ds}')" style="cursor:pointer"><div class="mini-main"><div class="mini-kicker">${esc(row.src_ip||'Unknown')} · ${esc(row.record_type||'DNS')}</div><div class="mini-title">${esc(row.query||'Unknown query')}</div><div class="mini-sub">${esc(reason)}</div></div><div class="mini-side"><div class="mini-score ${sCoreCls}">${score}</div><span class="risk-badge ${row.prediction==='TUNNEL'?'hi':riskBadgeCls(score)}">${row.prediction==='TUNNEL'?'Tunnel':row.risk_level||'Review'}</span></div></div>`;
     }).join(''):'<div class="mini-empty">No findings available for the current overview mode.</div>';
   }
 
@@ -1528,9 +1641,9 @@ function renderOverviewInsights(analytics,overviewAnalytics,overview) {
   if(hostWrap){
     const hosts=overviewAnalytics.sortedHosts.slice(0,4);
     hostWrap.innerHTML=hosts.length?hosts.map(([ip,host])=>{
-      const avg=host.total?Math.round(host.scoreSum/host.total):0, scoreCls=avg>=60?'bad':avg>=30?'warn':'';
+      const avg=host.total?Math.round(host.scoreSum/host.total):0;
       const descriptor=host.tunnels?`${host.tunnels} tunnel hits across ${host.total} queries`:`${host.total} queries observed, no tunnel verdict`;
-      return `<div class="mini-item"><div class="mini-main"><div class="mini-kicker">Source host</div><div class="mini-title">${esc(ip)}</div><div class="mini-sub">${esc(descriptor)} · ${host.types.size} record types.</div></div><div class="mini-side"><div class="mini-score ${scoreCls}">${avg}</div><span class="risk-badge ${host.tunnels?'hi':avg>=60?'hi':avg>=30?'med':'lo'}">${host.tunnels?'Flagged':'Observed'}</span></div></div>`;
+      return `<div class="mini-item"><div class="mini-main"><div class="mini-kicker">Source host</div><div class="mini-title">${esc(ip)}</div><div class="mini-sub">${esc(descriptor)} · ${host.types.size} record types.</div></div><div class="mini-side"><div class="mini-score ${riskCls(avg)}">${avg}</div><span class="risk-badge ${host.tunnels?'hi':riskBadgeCls(avg)}">${host.tunnels?'Flagged':'Observed'}</span></div></div>`;
     }).join(''):'<div class="mini-empty">No host summaries available yet.</div>';
   }
 }
@@ -1546,11 +1659,15 @@ const T2='rgba(102,115,133,1)';
 const CHART_DEFAULTS={
   responsive:true,maintainAspectRatio:false,
   plugins:{legend:{display:false},tooltip:{backgroundColor:'rgba(22,35,54,.94)',borderColor:'rgba(255,255,255,.08)',borderWidth:1,titleColor:'#f8f4ec',bodyColor:'#d8e2f2',titleFont:{family:'IBM Plex Mono',size:11},bodyFont:{family:'IBM Plex Mono',size:10},padding:12,cornerRadius:12}},
-  scales:{x:{grid:{color:'rgba(21,34,53,.05)',drawBorder:false},ticks:{color:'#7e8897',font:{family:'IBM Plex Mono',size:9}}},y:{grid:{color:'rgba(21,34,53,.05)',drawBorder:false},ticks:{color:'#7e8897',font:{family:'IBM Plex Mono',size:9}}}}
+  scales:{x:{border:{display:false},grid:{color:'rgba(21,34,53,.05)'},ticks:{color:'#7e8897',font:{family:'IBM Plex Mono',size:9}}},y:{border:{display:false},grid:{color:'rgba(21,34,53,.05)'},ticks:{color:'#7e8897',font:{family:'IBM Plex Mono',size:9}}}}
 };
 
 function destroyCharts() { Object.values(G.charts).forEach(c=>{try{c.destroy()}catch(e){}}); G.charts={}; }
 function mkChart(id,cfg) { const ctx=document.getElementById(id); if(!ctx) return; if(G.charts[id]){try{G.charts[id].destroy()}catch(e){}} G.charts[id]=new Chart(ctx,cfg); return G.charts[id]; }
+// Shorthand for simple bar charts that only differ in labels + dataset colours
+function mkBar(id, labels, data, bgFn, borderFn) {
+  mkChart(id,{type:'bar',data:{labels,datasets:[{data,backgroundColor:bgFn?labels.map((_,i)=>bgFn(i)):CY2,borderColor:borderFn?labels.map((_,i)=>borderFn(i)):CY,borderWidth:1,borderRadius:3}]},options:{...CHART_DEFAULTS}});
+}
 
 function renderCharts(analytics,overview) {
   $set('cc-timeline-sub',`${overview.label} · ${fmt(analytics.total)} DNS queries in view`);
@@ -1559,7 +1676,8 @@ function renderCharts(analytics,overview) {
   mkChart('ch-donut',{type:'doughnut',data:{labels:['High Risk (≥60)','Medium (30–59)','Low (<30)'],datasets:[{data:[analytics.hiRisk,analytics.medRisk,analytics.loRisk],backgroundColor:[RED,AMB,GRN],borderWidth:0,hoverOffset:4}]},options:{...CHART_DEFAULTS,cutout:'68%',plugins:{...CHART_DEFAULTS.plugins,legend:{display:false}}}});
   const dl=document.getElementById('donut-legend'); if(dl) dl.innerHTML=[['High Risk',RED,analytics.hiRisk],['Medium',AMB,analytics.medRisk],['Low',GRN,analytics.loRisk]].map(([l,c,n])=>`<div class="leg-item"><div class="leg-dot" style="background:${c}"></div>${l}: <b>${n}</b></div>`).join('');
   mkChart('ch-types',{type:'bar',data:{labels:analytics.topRecordTypes,datasets:[{data:analytics.topRecordTypes.map(k=>analytics.recordTypes[k]),backgroundColor:CY2,borderColor:CY,borderWidth:1,borderRadius:3}]},options:{...CHART_DEFAULTS,indexAxis:'y'}});
-  mkChart('ch-entropy',{type:'bar',data:{labels:analytics.entropyLabels,datasets:[{data:analytics.entropyBuckets,backgroundColor:analytics.entropyBuckets.map((_,i)=>i>=8?RED2:i>=6?AMB2:CY2),borderColor:analytics.entropyBuckets.map((_,i)=>i>=8?RED:i>=6?AMB:CY),borderWidth:1,borderRadius:3}]},options:{...CHART_DEFAULTS}});
+  mkBar('ch-entropy', analytics.entropyLabels, analytics.entropyBuckets,
+    i=>i>=8?RED2:i>=6?AMB2:CY2, i=>i>=8?RED:i>=6?AMB:CY);
   mkChart('ch-hosts',{type:'bar',data:{labels:analytics.topHostKeys.map(k=>k.length>13?k.slice(-13):k),datasets:[{label:'Normal',data:analytics.topHostKeys.map(k=>(analytics.hostCounts[k]||0)-(analytics.hostTunnelCounts[k]||0)),backgroundColor:CY2,borderColor:CY,borderWidth:1,borderRadius:3},{label:'Tunnels',data:analytics.topHostKeys.map(k=>analytics.hostTunnelCounts[k]||0),backgroundColor:RED2,borderColor:RED,borderWidth:1,borderRadius:3}]},options:{...CHART_DEFAULTS,indexAxis:'y',scales:{...CHART_DEFAULTS.scales,x:{...CHART_DEFAULTS.scales.x,stacked:true},y:{...CHART_DEFAULTS.scales.y,stacked:true}}}});
 }
 
@@ -1596,7 +1714,7 @@ function renderFeatures(analytics) {
   const colorMap={cy:'var(--cy)',red:'var(--red)',amb:'var(--amb)',grn:'var(--grn)',pur:'var(--pur)'};
   const bgMap={cy:'var(--cy2)',red:'var(--red2)',amb:'var(--amb2)',grn:'var(--grn2)',pur:'var(--pur2)'};
 
-  document.getElementById('feat-stat-cards').innerHTML=cards.map(c=>`
+  $('feat-stat-cards').innerHTML=cards.map(c=>`
     <div class="feat-stat-card">
       <div class="feat-stat-head">
         <div class="feat-stat-label">${c.label}</div>
@@ -1611,12 +1729,12 @@ function renderFeatures(analytics) {
 
   // Threshold exceedance table
   const threshRows=[
-    {name:'subdomain_entropy',desc:'Shannon entropy of the subdomain label',thr:`> ${T.subdomain_entropy||3.8}`,over:fs.entropy.over,weight:'12.5%'},
-    {name:'subdomain_length',desc:'Number of characters in subdomain',thr:`> ${T.subdomain_length||45}`,over:fs.sublen.over,weight:'12.5%'},
-    {name:'query_rate_per_min',desc:'Queries per minute from this source IP',thr:`> ${T.query_rate_per_min||5}`,over:fs.qrate.over,weight:'12.5%'},
-    {name:'special_type_count',desc:'Count of TXT, NULL, or MX records from source',thr:`> ${T.special_type_count||10}`,over:fs.specialtype.over,weight:'12.5%'},
+    {name:'subdomain_entropy',desc:'How random the subdomain looks — high values (> 3.8) suggest encoded or encrypted data',thr:`> ${T.subdomain_entropy||3.8}`,over:fs.entropy.over,weight:'12.5%'},
+    {name:'subdomain_length',desc:'Number of characters in the subdomain label — tunneling tools use very long labels to carry data',thr:`> ${T.subdomain_length||45}`,over:fs.sublen.over,weight:'12.5%'},
+    {name:'query_rate_per_min',desc:'How many queries per minute from this device — high rates suggest automated tunneling',thr:`> ${T.query_rate_per_min||5}`,over:fs.qrate.over,weight:'12.5%'},
+    {name:'special_type_count',desc:'Count of TXT, NULL, or MX record requests — these types can carry arbitrary data and are abused by tunneling tools',thr:`> ${T.special_type_count||10}`,over:fs.specialtype.over,weight:'12.5%'},
   ];
-  document.getElementById('thresh-tbl-body').innerHTML=threshRows.map(r=>{
+  $('thresh-tbl-body').innerHTML=threshRows.map(r=>{
     const pct=n?((r.over/n)*100).toFixed(1):'0.0';
     return `<tr>
       <td><div class="feat-name">${r.name}</div><div class="feat-desc">${r.desc}</div></td>
@@ -1629,13 +1747,15 @@ function renderFeatures(analytics) {
 
   // Feature distribution charts
   const sublabels=['0–9','10–19','20–29','30–39','40–49','50–59','60–69','70–79','80–89','90+'];
-  mkChart('ch-sublen',{type:'bar',data:{labels:sublabels,datasets:[{data:analytics.sublenBuckets,backgroundColor:analytics.sublenBuckets.map((_,i)=>i>=5?RED2:i>=4?AMB2:CY2),borderColor:analytics.sublenBuckets.map((_,i)=>i>=5?RED:i>=4?AMB:CY),borderWidth:1,borderRadius:3}]},options:{...CHART_DEFAULTS,plugins:{...CHART_DEFAULTS.plugins,tooltip:{...CHART_DEFAULTS.plugins.tooltip,callbacks:{title:([i])=>`Length ${sublabels[i.dataIndex]}`}}}}});
+  mkBar('ch-sublen', sublabels, analytics.sublenBuckets,
+    i=>i>=5?RED2:i>=4?AMB2:CY2, i=>i>=5?RED:i>=4?AMB:CY);
 
   const hexlabels=['0%','10%','20%','30%','40%','50%','60%','70%','80%','90%+'];
-  mkChart('ch-hexratio',{type:'bar',data:{labels:hexlabels,datasets:[{data:analytics.hexBuckets,backgroundColor:analytics.hexBuckets.map((_,i)=>i>=7?RED2:i>=5?AMB2:CY2),borderColor:analytics.hexBuckets.map((_,i)=>i>=7?RED:i>=5?AMB:CY),borderWidth:1,borderRadius:3}]},options:{...CHART_DEFAULTS}});
+  mkBar('ch-hexratio', hexlabels, analytics.hexBuckets,
+    i=>i>=7?RED2:i>=5?AMB2:CY2, i=>i>=7?RED:i>=5?AMB:CY);
 
   const qlabels=['0–19','20–39','40–59','60–79','80–99','100–119','120–139','140–159','160–179','180+'];
-  mkChart('ch-qlen',{type:'bar',data:{labels:qlabels,datasets:[{data:analytics.qlenBuckets,backgroundColor:CY2,borderColor:CY,borderWidth:1,borderRadius:3}]},options:{...CHART_DEFAULTS}});
+  mkBar('ch-qlen', qlabels, analytics.qlenBuckets, null, null);
 
   // ML score by rule hits (grouped bar)
   const ruleLabels=['0 hits','1 hit','2 hits','3 hits','4 hits'];
@@ -1644,7 +1764,7 @@ function renderFeatures(analytics) {
   mkChart('ch-mlrule',{type:'bar',data:{labels:ruleLabels,datasets:[{label:'Avg ML Score',data:avgMlPerRule,backgroundColor:[CY2,AMB2,AMB2,RED2,RED2],borderColor:[CY,AMB,AMB,RED,RED],borderWidth:1,borderRadius:4,yAxisID:'y'},{label:'Query Count',data:countPerRule,type:'line',borderColor:T2,backgroundColor:'transparent',borderWidth:1.5,pointRadius:3,tension:.3,yAxisID:'y1'}]},options:{...CHART_DEFAULTS,plugins:{...CHART_DEFAULTS.plugins,legend:{display:true,labels:{color:'#667385',font:{family:'IBM Plex Mono',size:10}}}},scales:{y:{...CHART_DEFAULTS.scales.y,position:'left',title:{display:true,text:'Avg ML Score',color:'#8d97a6',font:{family:'IBM Plex Mono',size:9}}},y1:{position:'right',grid:{drawOnChartArea:false},ticks:{color:'#7e8897',font:{family:'IBM Plex Mono',size:9}},title:{display:true,text:'Query Count',color:'#8d97a6',font:{family:'IBM Plex Mono',size:9}}}}}});
 
   const dlabels=['0%','10%','20%','30%','40%','50%','60%','70%','80%','90%+'];
-  mkChart('ch-digitratio',{type:'bar',data:{labels:dlabels,datasets:[{data:analytics.digitBuckets,backgroundColor:CY2,borderColor:CY,borderWidth:1,borderRadius:3}]},options:{...CHART_DEFAULTS}});
+  mkBar('ch-digitratio', dlabels, analytics.digitBuckets, null, null);
 }
 
 // ── Alerts Table ───────────────────────────────────────────────────────────────
@@ -1657,28 +1777,27 @@ function applyFilter() {
   _filteredRows=filtered; renderAlertRows(filtered); $set('tbl-count',filtered.length.toLocaleString()+' results');
 }
 function renderAlertRows(rows) {
-  const tbody=document.getElementById('alert-tbody'), empty=document.getElementById('alert-empty');
-  if(!rows.length){tbody.innerHTML='';empty.style.display='flex';return;}
-  empty.style.display='none';
+  const tbody=document.getElementById('alert-tbody');
+  if(!rows.length){tbody.innerHTML=''; show('alert-empty',true); return;}
+  show('alert-empty',false);
   const SPECIAL=['TXT','NULL','MX'];
   tbody.innerHTML=rows.map(r=>{
     const score=+r.risk_score||0, isTun=r.prediction==='TUNNEL';
-    const badgeCls=score>=60?'hi':score>=30?'med':'lo';
+    const barColor=riskCol(score);
     const badgeTxt=isTun?'TUNNEL':score>=60?'HIGH':score>=30?'MEDIUM':'CLEAN';
-    const barColor=score>=60?'var(--red)':score>=30?'var(--amb)':'var(--grn)';
     const isSpecial=SPECIAL.includes(r.record_type);
-    const ds=encodeURIComponent(JSON.stringify(r));
+    const ds=encodeURIComponent(JSON.stringify(r)).replace(/'/g,'%27');
     return `<tr onclick="openDrawer('${ds}')">
       <td><div class="td-query" title="${esc(r.query||'')}">${esc(r.query||'—')}</div></td>
       <td><div class="td-sub" title="${esc(r.subdomain||'')}">${esc(r.subdomain||'—')}</div></td>
       <td><div class="td-ip">${esc(r.src_ip||'—')}</div></td>
       <td><span class="td-type${isSpecial?' special':''}">${esc(r.record_type||'?')}</span></td>
       <td><div style="display:flex;align-items:center;gap:7px"><span style="font-family:var(--mono);font-size:11px;font-weight:600;color:${barColor}">${score}</span><div class="score-bar-mini"><div class="score-bar-mini-fill" style="width:${score}%;background:${barColor}"></div></div></div></td>
-      <td><span class="risk-badge ${badgeCls}">${badgeTxt}</span></td>
-      <td><span style="font-family:var(--mono);font-size:11px;color:var(--t2)">${(+r.subdomain_entropy||0).toFixed(3)}</span></td>
-      <td><span style="font-family:var(--mono);font-size:11px;color:${r.subdomain_length>45?'var(--red)':'var(--t2)'}">${r.subdomain_length||0}</span></td>
-      <td><span style="font-family:var(--mono);font-size:11px;color:${r.hex_ratio>0.6?'var(--amb)':'var(--t2)'}">${(+r.hex_ratio||0).toFixed(2)}</span></td>
-      <td><div class="hbtn" style="font-size:11px;padding:4px 10px" onclick="event.stopPropagation();openDrawer('${ds}')"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="width:11px;height:11px"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>Details</div></td>
+      <td><span class="risk-badge ${riskBadgeCls(score)}">${badgeTxt}</span></td>
+      <td><span style="font-family:var(--mono);font-size:11px;color:var(--t2)" title="Subdomain randomness score (0–5). Values above 3.8 are suspicious.">${(+r.subdomain_entropy||0).toFixed(3)}</span></td>
+      <td><span style="font-family:var(--mono);font-size:11px;color:${r.subdomain_length>45?'var(--red)':'var(--t2)'}" title="Length of subdomain label in characters. Over 45 chars is flagged.">${r.subdomain_length||0}</span></td>
+      <td><span style="font-family:var(--mono);font-size:11px;color:${r.hex_ratio>0.6?'var(--amb)':'var(--t2)'}" title="Fraction of subdomain made up of hex characters (0–1). Over 0.6 is suspicious.">${(+r.hex_ratio||0).toFixed(2)}</span></td>
+      <td><button class="hbtn-sm" onclick="event.stopPropagation();openDrawer('${ds}')"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>Details</button></td>
     </tr>`;
   }).join('');
 }
@@ -1689,13 +1808,13 @@ function updateBadge(analytics) { const n=analytics.tunnels, b=document.getEleme
 
 // ── Hosts ─────────────────────────────────────────────────────────────────────
 function renderHosts(analytics) {
-  const grid=document.getElementById('host-grid'), empty=document.getElementById('host-empty');
-  if(!analytics.total){grid.innerHTML='';empty.style.display='flex';return;}
-  empty.style.display='none';
+  const grid=document.getElementById('host-grid');
+  if(!analytics.total){grid.innerHTML=''; show('host-empty',true); return;}
+  show('host-empty',false);
   const maxTotal=Math.max(...analytics.sortedHosts.map(([,v])=>v.total));
   grid.innerHTML=analytics.sortedHosts.slice(0,24).map(([ip,h])=>{
     const avg=h.total?Math.round(h.scoreSum/h.total):0;
-    const pct=Math.round(h.total/maxTotal*100), riskColor=avg>=60?'var(--red)':avg>=30?'var(--amb)':'var(--grn)';
+    const pct=Math.round(h.total/maxTotal*100), riskColor=riskCol(avg);
     const tPct=Math.round(h.tunnels/h.total*100);
     const badge=h.tunnels>0?`<span class="risk-badge hi">${h.tunnels} tunnels</span>`:`<span class="risk-badge lo">Clean</span>`;
     const entropyWarn=h.entropyAvg>3.8, hexWarn=h.hexAvg>0.6, qrateWarn=h.qrateMax>5, specialWarn=h.specialCount>10;
@@ -1716,27 +1835,27 @@ function renderHosts(analytics) {
       <div class="hc-feat-grid">
         <div class="hc-feat ${entropyWarn?'danger':''}">
           <div class="hc-feat-num">${h.entropyAvg.toFixed(2)}</div>
-          <div class="hc-feat-lbl">AVG ENTROPY${entropyWarn?' ⚡':''}</div>
+          <div class="hc-feat-lbl">AVG RANDOMNESS${entropyWarn?' ⚡':''}</div>
         </div>
         <div class="hc-feat ${hexWarn?'warn':''}">
           <div class="hc-feat-num">${(h.hexAvg*100).toFixed(0)}%</div>
-          <div class="hc-feat-lbl">HEX RATIO${hexWarn?' ⚡':''}</div>
+          <div class="hc-feat-lbl">HEX CHARS${hexWarn?' ⚡':''}</div>
         </div>
         <div class="hc-feat ${qrateWarn?'danger':''}">
           <div class="hc-feat-num">${h.qrateMax.toFixed(1)}</div>
-          <div class="hc-feat-lbl">MAX Q/MIN${qrateWarn?' ⚡':''}</div>
+          <div class="hc-feat-lbl">PEAK Q/MIN${qrateWarn?' ⚡':''}</div>
         </div>
         <div class="hc-feat">
           <div class="hc-feat-num">${Math.round(h.qlenAvg)}</div>
-          <div class="hc-feat-lbl">AVG Q LEN</div>
+          <div class="hc-feat-lbl">AVG Q LENGTH</div>
         </div>
         <div class="hc-feat">
           <div class="hc-feat-num">${Math.round(h.responseAvg)}</div>
-          <div class="hc-feat-lbl">AVG RESP B</div>
+          <div class="hc-feat-lbl">AVG RESP BYTES</div>
         </div>
         <div class="hc-feat ${specialWarn?'danger':''}">
           <div class="hc-feat-num">${h.specialCount}</div>
-          <div class="hc-feat-lbl">SPECIAL CT${specialWarn?' ⚡':''}</div>
+          <div class="hc-feat-lbl">SPECIAL RECS${specialWarn?' ⚡':''}</div>
         </div>
       </div>
       <div style="font-size:11px;color:var(--t3);font-family:var(--mono);margin-top:4px">${h.uniqueDomains} unique domains queried</div>
@@ -1749,7 +1868,7 @@ function renderSettings(thresholds) {
   const T=thresholds||{subdomain_length:45,subdomain_entropy:3.8,query_rate_per_min:5,special_type_count:10};
   const TICONS={subdomain_length:'M4 8h16M4 12h16M4 16h12',subdomain_entropy:'M22 12h-4l-3 9L9 3l-3 9H2',query_rate_per_min:'M13 2L3 14h9l-1 8 10-12h-9l1-8z',special_type_count:'M3 6h18M3 12h18M3 18h18'};
   const TLABELS={subdomain_length:'Max subdomain length',subdomain_entropy:'Entropy threshold',query_rate_per_min:'Max queries per minute',special_type_count:'Special record type count'};
-  const tb=document.getElementById('thresh-body');
+  const tb=$('thresh-body');
   if(tb) tb.innerHTML=Object.entries(T).map(([k,v])=>`<div class="thr-row"><span class="thr-key"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="${TICONS[k]||'M12 12h.01'}"/></svg>${TLABELS[k]||k}</span><span class="thr-hint">flag if &gt;</span><span class="thr-val">${v}</span></div>`).join('');
 
   const METHODS=[
@@ -1757,23 +1876,23 @@ function renderSettings(thresholds) {
     {c:'var(--grn)',bg:'var(--grn2)',ic:'M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z',k:'Isolation Forest (ML anomaly detection)',v:'Unsupervised model trained across 10 behavioral and lexical features. Scores each query as a normalized anomaly value 0–1. Catches unusual patterns that miss hard rule thresholds. Contamination=0.25, estimators=200, random_state=42.'},
     {c:'var(--red)',bg:'var(--red2)',ic:'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z',k:'Weighted Risk Scoring',v:'Final score = (rule_hits/4)×50 + ml_score×50, giving a 0–100 composite threat rating. Score ≥ 50 → classified as TUNNEL. Score ≥ 60 → flagged High Risk. Score 30–59 → Medium Risk. Score <30 → Low Risk.'},
   ];
-  const ml=document.getElementById('mth-list');
+  const ml=$('mth-list');
   if(ml) ml.innerHTML=METHODS.map(m=>`<div class="mth-item"><div class="mth-dot" style="background:${m.bg};color:${m.c}"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="${m.ic}"/></svg></div><div><div class="mth-key">${m.k}</div><div class="mth-val">${m.v}</div></div></div>`).join('');
 
   const ML_FEATURES=[
-    {name:'query_length',desc:'Total character length of the full DNS query string'},
-    {name:'subdomain_length',desc:'Character length of the leftmost subdomain label'},
-    {name:'subdomain_entropy',desc:'Shannon entropy of the subdomain (high = more random)'},
-    {name:'dot_count',desc:'Number of dot-separated labels in the query'},
-    {name:'digit_ratio',desc:'Fraction of characters in the query that are digits'},
-    {name:'hex_ratio',desc:'Fraction of subdomain characters that are hexadecimal'},
-    {name:'query_count',desc:'Total DNS queries sent by this source IP in the capture'},
-    {name:'avg_entropy',desc:'Average subdomain entropy across all queries from this source'},
-    {name:'query_rate_per_min',desc:'Queries per minute from the source IP across the capture window'},
-    {name:'avg_response',desc:'Average DNS response packet size in bytes from this source'},
+    {name:'query_length',       label:'Query Length',            desc:'Total character length of the full DNS query string — tunneling queries tend to be much longer than normal lookups'},
+    {name:'subdomain_length',   label:'Subdomain Length',        desc:'Character length of the leftmost label — normal hostnames are short, but tunneling tools pack data here making it very long'},
+    {name:'subdomain_entropy',  label:'Subdomain Randomness',    desc:'How random the subdomain looks (Shannon entropy). High values indicate encoded or encrypted content rather than a real hostname'},
+    {name:'dot_count',          label:'Label Count',             desc:'Number of dot-separated parts in the query. Unusually deep nesting can be a tunneling indicator'},
+    {name:'digit_ratio',        label:'Digit Density',           desc:'Fraction of the query made up of digits. Encoded data often contains many numbers'},
+    {name:'hex_ratio',          label:'Hex Character Density',   desc:'Fraction of the subdomain made up of hexadecimal characters (0–9, a–f). Suggests binary data encoded as hex'},
+    {name:'query_count',        label:'Device Query Volume',     desc:'Total DNS queries sent by this device during the capture — unusually high counts are a behavioural signal'},
+    {name:'avg_entropy',        label:'Device Avg Randomness',   desc:'Average subdomain randomness across all queries from this device. Consistently high values are a strong tunnel indicator'},
+    {name:'query_rate_per_min', label:'Queries Per Minute',      desc:'How fast this device is sending DNS requests. Automated tunneling tools generate much higher rates than a human browsing the web'},
+    {name:'avg_response',       label:'Avg Response Size',       desc:'Average DNS response packet size in bytes. Tunneling may inflate response sizes when data is carried back'},
   ];
   const mfl=document.getElementById('ml-features-list');
-  if(mfl) mfl.innerHTML=ML_FEATURES.map((f,i)=>`<div style="background:var(--bg2);border:1px solid var(--bord);border-radius:14px;padding:12px 14px;display:flex;flex-direction:column;gap:4px"><div style="font-family:var(--mono);font-size:11px;font-weight:600;color:var(--cy)">[${i+1}] ${f.name}</div><div style="font-size:11px;color:var(--t2);line-height:1.5">${f.desc}</div></div>`).join('');
+  if(mfl) mfl.innerHTML=ML_FEATURES.map((f,i)=>`<div style="background:var(--bg2);border:1px solid var(--bord);border-radius:14px;padding:12px 14px;display:flex;flex-direction:column;gap:4px"><div style="font-family:var(--mono);font-size:11px;font-weight:600;color:var(--cy)">[${i+1}] ${f.label}</div><div style="font-size:10px;color:var(--t3);font-family:var(--mono);margin-bottom:2px">${f.name}</div><div style="font-size:11px;color:var(--t2);line-height:1.5">${f.desc}</div></div>`).join('');
 }
 
 // ── Drawer ────────────────────────────────────────────────────────────────────
@@ -1781,28 +1900,26 @@ function openDrawer(ds) {
   const r=JSON.parse(decodeURIComponent(ds));
   const score=+r.risk_score||0, isTun=r.prediction==='TUNNEL';
   const reasons=Array.isArray(r.rule_reasons)?r.rule_reasons:String(r.rule_reasons||'').split(';').map(s=>s.trim()).filter(Boolean);
-  const col=score>=60?'var(--red)':score>=30?'var(--amb)':'var(--grn)';
-  const bg=score>=60?'var(--red2)':score>=30?'var(--amb2)':'var(--grn2)';
-  const gbg=score>=60?'linear-gradient(90deg,var(--red),#ff6680)':score>=30?'linear-gradient(90deg,var(--amb),#ffcc00)':'linear-gradient(90deg,var(--grn),#7fffd4)';
+  const col=riskCol(score), bg=riskBg(score), gbg=riskGrad(score);
 
-  document.getElementById('drw-query').textContent=r.query||'Unknown query';
-  document.getElementById('drw-query-sub').textContent=r.ts?new Date(r.ts*1000).toLocaleString():'';
+  $('drw-query').textContent=r.query||'Unknown query';
+  $('drw-query-sub').textContent=r.ts?new Date(r.ts*1000).toLocaleString():'';
 
-  const ic=document.getElementById('drw-icon');
+  const ic=$('drw-icon');
   ic.style.background=bg; ic.style.color=col;
   ic.innerHTML=`<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="width:18px;height:18px"><path d="${isTun?'M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0zM12 9v4M12 17h.01':'M22 11.08V12a10 10 0 11-5.93-9.14M22 4L12 14.01l-3-3'}"/></svg>`;
 
-  document.getElementById('drw-body').innerHTML=`
+  $('drw-body').innerHTML=`
     <div class="score-row">
       <div class="score-box">
         <div class="score-num" style="color:${col}">${score}</div>
-        <div class="score-lbl">${r.risk_level||'Low'} Risk · out of 100</div>
-        <div class="score-track"><div class="score-fill" id="sf" style="background:${gbg}"></div></div>
+        <div class="score-lbl">${esc(r.risk_level||'Low')} Risk · out of 100</div>
+        <div class="score-track"><div class="score-fill score-fill-bar" style="background:${gbg}"></div></div>
         <div class="score-ticks"><span>0 Safe</span><span>50 Tunnel</span><span>100 Critical</span></div>
       </div>
       <div class="verdict-box">
-        <div class="verdict-tag" style="color:${col}">${isTun?'Tunnel signal detected':'Looks normal'}</div>
-        <div class="verdict-sub">${isTun?'This query crossed the tunnel threshold. The combined rule engine and Isolation Forest scores indicate suspicious DNS behavior.':'This query stayed below the tunnel threshold and does not stand out strongly against the rest of the capture.'}</div>
+        <div class="verdict-tag" style="color:${col}">${isTun?'Hidden data detected':'Looks normal'}</div>
+        <div class="verdict-sub">${isTun?'This query crossed the tunneling detection threshold. The combined rule checks and anomaly model both indicate suspicious DNS behaviour — this device may be secretly moving data through DNS.':'This query stayed below the detection threshold and does not stand out strongly against the rest of the capture. No immediate action is needed.'}</div>
       </div>
     </div>
 
@@ -1820,15 +1937,15 @@ function openDrawer(ds) {
     </div>
 
     <div class="drw-section">
-      <div class="drw-sec-title"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Lexical Signal Analysis</div>
+      <div class="drw-sec-title"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>Query Pattern Analysis</div>
       <div class="mini-score-grid">
         <div class="mscore-box" style="border-color:${r.subdomain_entropy>3.8?'rgba(196,75,64,.2)':'var(--bord)'}">
           <div class="mscore-val" style="color:${r.subdomain_entropy>3.8?'var(--red)':'var(--txt)'}">${fmt2(r.subdomain_entropy)}</div>
-          <div class="mscore-lbl">ENTROPY · threshold &gt;3.8</div>
+          <div class="mscore-lbl">RANDOMNESS · threshold &gt;3.8</div>
         </div>
         <div class="mscore-box" style="border-color:${r.subdomain_length>45?'rgba(196,75,64,.2)':'var(--bord)'}">
           <div class="mscore-val" style="color:${r.subdomain_length>45?'var(--red)':'var(--txt)'}">${r.subdomain_length||0}</div>
-          <div class="mscore-lbl">SUBDOMAIN LEN · threshold &gt;45</div>
+          <div class="mscore-lbl">SUBDOMAIN LENGTH · threshold &gt;45</div>
         </div>
         <div class="mscore-box">
           <div class="mscore-val" style="color:${r.hex_ratio>0.6?'var(--amb)':'var(--txt)'}">${fmt2(r.hex_ratio)}</div>
@@ -1848,16 +1965,16 @@ function openDrawer(ds) {
     </div>
 
     <div class="drw-section">
-      <div class="drw-sec-title"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>Source Behavioral Profile</div>
+      <div class="drw-sec-title"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>Device Traffic History</div>
       <div class="kv-list">
-        ${kv('Total Queries (source)', fmt(r.query_count||0))}
-        ${kv('Unique Domains (source)', fmt(r.unique_domains||0))}
+        ${kv('Total Queries (this device)', fmt(r.query_count||0))}
+        ${kv('Unique Domains Queried', fmt(r.unique_domains||0))}
         ${kv('Avg Query Length', fmt2(r.avg_qlen)+' chars')}
-        ${kv('Avg Subdomain Entropy', fmt2(r.avg_entropy), +r.avg_entropy>3.5?'a':'')}
+        ${kv('Avg Subdomain Randomness', fmt2(r.avg_entropy), +r.avg_entropy>3.5?'a':'')}
         ${kv('Avg Response Size', fmt2(r.avg_response)+' bytes')}
-        ${kv('Special Type Count', (r.special_type_count||0)+' records', +r.special_type_count>10?'r':'', '· threshold >10')}
-        ${kv('Rule Hits', (r.rule_hits||0)+' / 4')}
-        ${kv('ML Anomaly Score', fmt2(r.ml_score), +r.ml_score>0.6?'r':+r.ml_score>0.4?'a':'')}
+        ${kv('Suspicious Record Count', (r.special_type_count||0)+' records', +r.special_type_count>10?'r':'', '· threshold >10')}
+        ${kv('Rule Violations', (r.rule_hits||0)+' / 4 checks triggered')}
+        ${kv('Anomaly Model Score', fmt2(r.ml_score), +r.ml_score>0.6?'r':+r.ml_score>0.4?'a':'')}
       </div>
     </div>
 
@@ -1865,21 +1982,23 @@ function openDrawer(ds) {
       <div class="drw-sec-title"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>Why Was This Flagged?</div>
       ${reasons.length
         ? reasons.map(s=>`<div class="rule-item"><div class="rule-dot"><svg fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div><span>${esc(s.trim())}</span></div>`).join('')
-        : '<div class="no-rules">Flagged by the Isolation Forest ML anomaly model — the overall feature pattern is statistically unusual, but no individual rule threshold was exceeded. This is a signature of novel or low-volume tunneling behavior.</div>'
+        : '<div class="no-rules">Flagged by the machine-learning anomaly model — the overall pattern of this query is statistically unusual compared to normal traffic, but no individual rule threshold was exceeded. This is typical of low-volume or novel tunneling behaviour that flies under rule-based radars.</div>'
       }
     </div>`;
 
-  const ov=document.getElementById('drawer-overlay'), dr=document.getElementById('drawer');
+  const ov=$('drawer-overlay'), dr=$('drawer');
   ov.style.display='block';
   requestAnimationFrame(()=>{ ov.classList.add('vis'); dr.classList.add('open'); });
-  setTimeout(()=>{ const f=document.getElementById('sf'); if(f) f.style.width=score+'%'; },200);
+  setTimeout(()=>{ const f=dr.querySelector('.score-fill-bar'); if(f) f.style.width=score+'%'; },200);
 }
 
 function kv(k,v,cls,hint) {
-  return `<div class="kv"><span class="kv-k">${k}${hint?` <span style="font-size:9px;color:var(--t3);font-family:var(--mono)">${hint}</span>`:''}</span><span class="kv-v ${cls||''}">${v??'—'}</span></div>`;
+  const safeCls = ['a','b','r'].includes(cls) ? cls : '';
+  const safeValue = v == null || v === '' ? '—' : String(v);
+  return `<div class="kv"><span class="kv-k">${esc(k)}${hint?` <span style="font-size:9px;color:var(--t3);font-family:var(--mono)">${esc(hint)}</span>`:''}</span><span class="kv-v ${safeCls}">${esc(safeValue)}</span></div>`;
 }
 function closeDrawer() {
-  const ov=document.getElementById('drawer-overlay'), dr=document.getElementById('drawer');
+  const ov=$('drawer-overlay'), dr=$('drawer');
   ov.classList.remove('vis'); dr.classList.remove('open');
   setTimeout(()=>{ ov.style.display='none'; },300);
 }
@@ -1930,9 +2049,21 @@ function exportCSV() {
 }
 function $(id){return document.getElementById(id)}
 function $set(id,v){const e=$(id);if(e) e.textContent=v;}
-function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML;}
+function show(id,visible){const e=$(id);if(e) e.style.display=visible?'':'none';}
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
 function fmt(n){return(+n||0).toLocaleString();}
 function fmt2(n){return isNaN(+n)?'—':(+n).toFixed(3);}
+function mergeLiveEvents(existing,incoming){
+  const merged=[], seen=new Set();
+  [...(incoming||[]), ...(existing||[])].forEach((ev,idx)=>{
+    if(!ev) return;
+    const key = ev._event_version!=null ? `v:${ev._event_version}` : JSON.stringify([ev.ts, ev.query, ev.src_ip, ev.risk_score, idx]);
+    if(seen.has(key)) return;
+    seen.add(key);
+    merged.push(ev);
+  });
+  return merged.slice(0, 200);
+}
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
 function toast(msg,type) {
@@ -1949,7 +2080,7 @@ function toggleDark() {
   const isDark = document.body.classList.toggle('dark');
   localStorage.setItem('dns-shield-dark', isDark ? '1' : '0');
   const icon = document.getElementById('dark-icon');
-  if (icon) icon.setAttribute('d', isDark
+  if (icon) icon.querySelector('path').setAttribute('d', isDark
     ? 'M12 3v1m0 16v1m9-9h-1M4 12H3m15.36-6.36l-.71.71M6.34 17.66l-.7.7M17.66 17.66l-.7-.7M6.34 6.34l-.7-.71M12 5a7 7 0 100 14A7 7 0 0012 5z'
     : 'M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z');
 }
@@ -1960,53 +2091,52 @@ function updateClock() { const ts=document.getElementById('hd-ts'); if(ts) ts.te
 setInterval(updateClock,1000); updateClock();
 
 // ── Polling — offline results ─────────────────────────────────────────────────
-setInterval(async()=>{
-  if(!G.data) return;
+// ── Unified polling loop (offline results + live events, every 2 s) ────────────
+let _liveVersion = 0;
+async function _poll() {
+  // Offline PCAP results
   try {
     const res=await fetch('/results?since='+G.version), d=await res.json();
-    if(d.data&&d.version>G.version){ G.data=normalizeRows(d.data); G.version=d.version; G.pcap=d.pcap_name||G.pcap; G.thresholds=d.thresholds||G.thresholds; G.summary=d.summary||G.summary; G.analytics=null; loadDashboard(); }
-  }catch(e){}
-},4000);
-
-// ── Polling — live events from pcap_detector.py live mode ────────────────────
-let _liveVersion = 0;
-setInterval(async()=>{
-  try {
-    const res = await fetch('/live/status?since='+_liveVersion);
-    const d = await res.json();
-    if(!d || d.version<=_liveVersion) return;
-    _liveVersion = d.version;
-    G.live = {
-      mode: d.mode||'offline',
-      events: d.events||[],
-      tracker: d.tracker||{},
-      stats: d.stats||{total:0,high:0,medium:0,low:0,tunnel:0},
-      version: d.version,
-      interface: d.interface||'',
-      started_at: d.started_at||null
-    };
-    applyLiveUpdate();
+    if(d.data&&d.version>G.version){
+      G.data=normalizeRows(d.data); G.version=d.version;
+      G.pcap=d.pcap_name||G.pcap; G.thresholds=d.thresholds||G.thresholds;
+      G.summary=d.summary||G.summary; G.analytics=null;
+      loadDashboard();
+    }
   } catch(e){}
-}, 2000);
+  // Live events — always active
+  try {
+    const res=await fetch('/live/status?since='+_liveVersion), d=await res.json();
+    if(d && d.version>_liveVersion) {
+      _liveVersion=d.version;
+      const mergedEvents = Array.isArray(d.events) ? d.events : mergeLiveEvents(G.live.events||[], d.new_events||[]);
+      G.live={
+        mode:d.mode||'offline', events:mergedEvents, tracker:d.tracker||{},
+        stats:d.stats||{total:0,high:0,medium:0,low:0,tunnel:0},
+        version:d.version, interface:d.interface||'', started_at:d.started_at||null
+      };
+      applyLiveUpdate();
+    }
+  } catch(e){}
+}
+setInterval(_poll, 2000);
 
 function applyLiveUpdate() {
   const L = G.live;
   const isLive = L.mode === 'live';
 
-  // Header live pill
-  const pill = document.getElementById('hd-live-pill');
-  const readyPill = document.getElementById('hd-ready-pill');
-  if(pill) pill.style.display = isLive ? 'flex' : 'none';
-  if(readyPill) readyPill.style.display = isLive ? 'none' : 'flex';
+  // Header pills — 'flex' when visible, '' (block) when hidden via show()
+  const pill=$('hd-live-pill'), readyPill=$('hd-ready-pill');
+  if(pill){ pill.style.display = isLive ? 'flex' : 'none'; }
+  if(readyPill){ readyPill.style.display = isLive ? 'none' : 'flex'; }
 
-  // Live feed tab badge
-  const nbLive = document.getElementById('nb-live');
-  if(nbLive){ if(L.stats.tunnel>0){nbLive.textContent=L.stats.tunnel;nbLive.classList.add('show');}else nbLive.classList.remove('show'); }
-
-  // Tunnels tab badge
-  const nbTun = document.getElementById('nb-tunnels');
-  const tunCount = Object.keys(L.tracker).length;
-  if(nbTun){ if(tunCount>0){nbTun.textContent=tunCount;nbTun.classList.add('show');}else nbTun.classList.remove('show'); }
+  // Nav badges
+  function setBadge(id, n) {
+    const el=$(id); if(!el) return;
+    el.textContent=n; el.classList.toggle('show', n>0);
+  }
+  setBadge('nb-live', L.stats.tunnel);
+  setBadge('nb-tunnels', Object.keys(L.tracker).length);
 
   // Live feed panel stats
   $set('live-stat-total', fmt(L.stats.total));
@@ -2016,15 +2146,15 @@ function applyLiveUpdate() {
   $set('live-stat-low', fmt(L.stats.low||0));
 
   // Live feed sub-header
-  const liveSub = document.getElementById('live-feed-sub');
+  const liveSub = $('live-feed-sub');
   if(liveSub && isLive){
-    const iface = L.interface ? ` on ${esc(L.interface)}` : '';
+    const iface = L.interface ? ` on <b>${esc(L.interface)}</b>` : '';
     const since = L.started_at ? ` · started ${new Date(L.started_at).toLocaleTimeString()}` : '';
-    liveSub.textContent = `Capturing live DNS traffic${iface}${since}`;
+    liveSub.innerHTML = `Capturing live DNS traffic${iface}${since}`;
   }
 
   // Mode indicator in Live Feed view
-  const modeInd = document.getElementById('live-mode-indicator');
+  const modeInd = $('live-mode-indicator');
   if(modeInd) modeInd.style.display = isLive ? 'flex' : 'none';
 
   // Render event feed list
@@ -2038,79 +2168,76 @@ function applyLiveUpdate() {
   if(tunView && tunView.classList.contains('on')) renderTunnelIPs(L.tracker, L.stats);
 }
 
-// ── Live Feed renderer ────────────────────────────────────────────────────────
-let _renderedEventCount = 0;
 function renderLiveFeed(events) {
   const list = document.getElementById('live-feed-list');
-  const empty = document.getElementById('live-feed-empty');
   if(!list) return;
+  const empty = $('live-feed-empty');
+  Array.from(list.children).forEach(c => { if(c !== empty) c.remove(); });
 
-  if(!events||!events.length){ if(empty) empty.style.display=''; return; }
-  if(empty) empty.style.display = 'none';
+  if(!events || !events.length) {
+    show('live-feed-empty', true);
+    return;
+  }
+  show('live-feed-empty', false);
 
-  // Only re-render if new events arrived (prepend only new ones for perf)
-  const newCount = events.length - _renderedEventCount;
-  if(newCount <= 0 && _renderedEventCount > 0) return;
-
-  // Full re-render (max 200 events shown)
-  _renderedEventCount = events.length;
-  list.innerHTML = '';
-  if(empty) list.appendChild(empty);
-
-  events.slice(0, 100).forEach((ev, i) => {
+  // Build new card elements (newest events are at index 0)
+  const fragment = document.createDocumentFragment();
+  events.slice(0, MAX_VISIBLE_LIVE_EVENTS).forEach((ev) => {
     const score = +(ev.risk_score||0);
     const isTun = ev.prediction === 'TUNNEL';
     const level = String(ev.risk_level||'Low');
-    const scoreCls = score>=60?'bad':score>=30?'warn':'';
-    const col = score>=60?'var(--red)':score>=30?'var(--amb)':'var(--grn)';
-    const bg  = score>=60?'var(--red2)':score>=30?'var(--amb2)':'var(--grn2)';
+    const col = riskCol(score), bg = riskBg(score);
     const ts = ev.ts ? new Date(ev.ts*1000).toLocaleTimeString() : '';
     const reasons = Array.isArray(ev.rule_reasons)?ev.rule_reasons:(ev.rule_reasons?[ev.rule_reasons]:[]);
     const reasonText = reasons.length ? reasons[0] : (isTun ? 'Flagged by anomaly model — statistically unusual pattern.' : 'Within normal parameters.');
 
     const el = document.createElement('div');
     el.className = 'live-event-card';
-    el.style.cssText = `border-color:${isTun?'rgba(196,75,64,.22)':'var(--bord)'};`;
-    el.onmouseenter = ()=>el.style.boxShadow='0 6px 18px rgba(21,34,53,.08)';
-    el.onmouseleave = ()=>el.style.boxShadow='none';
-    el.onclick = ()=>{ const ds=encodeURIComponent(JSON.stringify(ev)); openDrawer(ds); };
+    if(isTun) el.style.borderColor = 'rgba(196,75,64,.22)';
+    el.onclick = ()=>{ openDrawer(encodeURIComponent(JSON.stringify(ev))); };
     el.innerHTML = `
       <div style="flex-shrink:0;width:36px;height:36px;border-radius:10px;background:${bg};display:flex;align-items:center;justify-content:center;color:${col}">
         <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="width:16px;height:16px"><path d="${isTun?'M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z':'M22 11.08V12a10 10 0 11-5.93-9.14M22 4L12 14.01l-3-3'}"/></svg>
       </div>
       <div style="flex:1;min-width:0">
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;flex-wrap:wrap">
           <span style="font-family:var(--mono);font-size:11px;font-weight:700;color:${col}">${esc(level.toUpperCase())} · ${score.toFixed(1)}/100</span>
           <span style="font-size:10px;color:var(--t3);font-family:var(--mono)">${esc(ts)}</span>
-          ${isTun?'<span style="font-size:10px;font-weight:700;font-family:var(--mono);background:var(--red2);color:var(--red);border-radius:999px;padding:2px 8px">TUNNEL</span>':''}
+          ${isTun?'<span style="font-size:10px;font-weight:700;font-family:var(--mono);background:var(--red2);color:var(--red);border-radius:999px;padding:2px 8px;border:1px solid rgba(196,75,64,.18)">TUNNEL</span>':''}
         </div>
         <div style="font-family:var(--mono);font-size:12px;font-weight:600;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(ev.query||'')}">${esc((ev.query||'unknown query').substring(0,72))}</div>
-        <div style="display:flex;gap:12px;margin-top:4px">
-          <span style="font-size:11px;color:var(--t2)">From: <b>${esc(ev.src_ip||'?')}</b></span>
-          <span style="font-size:11px;color:var(--t2)">Type: ${esc(ev.record_type||'?')}</span>
+        <div style="display:flex;gap:12px;margin-top:4px;flex-wrap:wrap">
+          <span style="font-size:11px;color:var(--t2)">From: <b style="color:var(--txt)">${esc(ev.src_ip||'?')}</b></span>
+          <span style="font-size:11px;color:var(--t2)">Type: <b style="color:var(--txt)">${esc(ev.record_type||'?')}</b></span>
         </div>
-        <div style="font-size:11px;color:var(--t3);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(reasonText)}</div>
+        <div style="font-size:11px;color:var(--t3);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(reasonText)}">${esc(reasonText)}</div>
       </div>
-      <div style="flex-shrink:0;text-align:right">
-        <div class="mini-score ${scoreCls}" style="font-size:16px;width:44px;height:44px">${score.toFixed(0)}</div>
+      <div style="flex-shrink:0">
+        <div class="live-score-badge ${riskCls(score)}">${score.toFixed(0)}</div>
       </div>`;
-    list.appendChild(el);
+    fragment.appendChild(el);
   });
+
+  if(empty) list.insertBefore(fragment, empty);
+  else list.appendChild(fragment);
 }
 
 function clearLiveFeed() {
   fetch('/live/reset',{method:'POST'}).catch(()=>{});
   G.live = { mode:'offline', events:[], tracker:{}, stats:{total:0,high:0,medium:0,low:0,tunnel:0}, version:0, interface:'', started_at:null };
-  _renderedEventCount = 0;
   _liveVersion = 0;
   applyLiveUpdate();
   toast('Live feed cleared');
 }
 
+// ── kpiCard builder — used by live stats row and tunnel summary cards ──────────
+function kpiCard(bg, col, iconPath, val, label, sub) {
+  return `<div class="kpi-card"><div class="kpi-icon" style="background:${bg};color:${col}"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="${iconPath}"/></svg></div><div class="kpi-body"><div class="kpi-val">${val}</div><div class="kpi-label">${label}</div><div class="kpi-sub">${sub}</div></div></div>`;
+}
+
 // ── Confirmed Tunnel IPs renderer ─────────────────────────────────────────────
 function renderTunnelIPs(tracker, stats) {
   const grid = document.getElementById('tunnel-ip-grid');
-  const empty = document.getElementById('tunnel-empty');
   const summCards = document.getElementById('tunnel-summary-cards');
   if(!grid) return;
 
@@ -2118,13 +2245,16 @@ function renderTunnelIPs(tracker, stats) {
   const tunCount = entries.length;
 
   // Summary cards
-  if(summCards) summCards.innerHTML = `
-    <div class="kpi-card"><div class="kpi-icon" style="background:var(--red2);color:var(--red)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg></div><div class="kpi-body"><div class="kpi-val">${tunCount}</div><div class="kpi-label">Confirmed Sources</div><div class="kpi-sub">unique device${tunCount!==1?'s':''} caught</div></div></div>
-    <div class="kpi-card"><div class="kpi-icon" style="background:var(--amb2);color:var(--amb)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div><div class="kpi-body"><div class="kpi-val">${fmt(entries.reduce((s,[,v])=>s+(+v.flagged_queries||0),0))}</div><div class="kpi-label">Suspicious Queries</div><div class="kpi-sub">from confirmed tunnel sources</div></div></div>
-    <div class="kpi-card"><div class="kpi-icon" style="background:var(--cy2);color:var(--cy)"><svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg></div><div class="kpi-body"><div class="kpi-val">${tunCount?entries.reduce((mx,[,v])=>Math.max(mx,+(v.max_risk_score||0)),0).toFixed(0):'—'}</div><div class="kpi-label">Peak Risk Score</div><div class="kpi-sub">out of 100</div></div></div>`;
+  if(summCards) summCards.innerHTML =
+    kpiCard('var(--red2)','var(--red)','M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z',
+      tunCount, 'Confirmed Sources', `unique device${tunCount!==1?'s':''} caught`) +
+    kpiCard('var(--amb2)','var(--amb)','M22 12h-4l-3 9L9 3l-3 9H2',
+      fmt(entries.reduce((s,[,v])=>s+(+v.flagged_queries||0),0)), 'Suspicious Queries', 'from confirmed tunnel sources') +
+    kpiCard('var(--cy2)','var(--cy)','M12 2a10 10 0 100 20A10 10 0 0012 2zM12 8v4M12 16h.01',
+      tunCount?entries.reduce((mx,[,v])=>Math.max(mx,+(v.max_risk_score||0)),0).toFixed(0):'—', 'Peak Risk Score', 'out of 100');
 
-  if(!tunCount){ if(empty) empty.style.display=''; grid.innerHTML=''; return; }
-  if(empty) empty.style.display = 'none';
+  if(!tunCount){ show('tunnel-empty',true); grid.innerHTML=''; return; }
+  show('tunnel-empty',false);
 
   // Sort by peak risk score descending
   const sorted = entries.slice().sort((a,b)=>(+(b[1].max_risk_score||0))-(+(a[1].max_risk_score||0)));
@@ -2136,8 +2266,7 @@ function renderTunnelIPs(tracker, stats) {
     const reasons = Array.isArray(info.reasons) ? info.reasons : (info.reasons ? [...info.reasons] : []);
     const firstSeen = info.first_seen ? new Date(info.first_seen).toLocaleString() : '—';
     const lastSeen  = info.last_seen  ? new Date(info.last_seen).toLocaleString()  : '—';
-    const col = peakScore>=60?'var(--red)':peakScore>=30?'var(--amb)':'var(--grn)';
-    const bg  = peakScore>=60?'var(--red2)':peakScore>=30?'var(--amb2)':'var(--grn2)';
+    const col = riskCol(peakScore), bg = riskBg(peakScore);
     const urgency = peakScore>=60 ? 'HIGH PRIORITY — Investigate immediately' : peakScore>=30 ? 'MEDIUM — Review recommended' : 'LOW — Monitor';
     const urgencyExplain = peakScore>=60
       ? 'This device was flagged with very high confidence. It is strongly recommended to isolate it from the network and investigate what data it may have exfiltrated.'
@@ -2223,6 +2352,12 @@ function exportTunnelCSV() {
 function populateTunnelsFromOfflineData(rows) {
   // Build a pseudo-tracker from the offline PCAP results
   const tracker = {};
+  const stats = { total:(rows||[]).length, high:0, medium:0, low:0, tunnel:0 };
+  (rows||[]).forEach(r=>{
+    const level = String(r.risk_level||'Low').toLowerCase();
+    if(level in stats) stats[level] += 1;
+    if(r.prediction==='TUNNEL') stats.tunnel += 1;
+  });
   (rows||[]).filter(r=>r.prediction==='TUNNEL').forEach(r=>{
     const ip = r.src_ip||'Unknown';
     if(!tracker[ip]){
@@ -2248,11 +2383,16 @@ function populateTunnelsFromOfflineData(rows) {
   });
   // Convert Sets to arrays for rendering
   Object.values(tracker).forEach(v=>{ v.reasons=[...v.reasons]; });
-  // Merge with live tracker (live takes precedence per IP)
-  G.live.tracker = Object.assign({}, tracker, G.live.tracker);
-  const nbTun = document.getElementById('nb-tunnels');
-  const tunCount = Object.keys(G.live.tracker).length;
-  if(nbTun){ if(tunCount>0){nbTun.textContent=tunCount;nbTun.classList.add('show');}else nbTun.classList.remove('show'); }
+  G.live = {
+    ...G.live,
+    mode:'offline',
+    events:[],
+    tracker,
+    stats,
+    interface:'',
+    started_at:null
+  };
+  applyLiveUpdate();
 }
 
 // ── Init settings ─────────────────────────────────────────────────────────────
@@ -2270,10 +2410,14 @@ document.addEventListener('keydown',e=>{
 
 @app.route("/")
 def index():
-    return Response(HTML, mimetype="text/html")
+    page = HTML.replace("__MAX_VISIBLE_LIVE_EVENTS__", str(MAX_VISIBLE_LIVE_EVENTS))
+    return Response(page, mimetype="text/html")
 
 @app.route("/results")
 def results():
+    access_error = _require_local_access()
+    if access_error:
+        return access_error
     since = request.args.get("since", default=0, type=int)
     snapshot = _snapshot()
     if snapshot["version"] <= since:
@@ -2282,17 +2426,26 @@ def results():
 
 @app.route("/push", methods=["POST"])
 def push():
+    access_error = _require_local_access()
+    if access_error:
+        return access_error
     payload = request.get_json(force=True, silent=True)
     if not payload:
         return _error_response("No payload", 400)
 
     data = payload.get("data")
-    if not data:
+    if not isinstance(data, list) or not data:
         return _error_response("Missing data", 400)
+    if len(data) > MAX_PUSH_ROWS:
+        return _error_response(f"Too many rows in one push (max {MAX_PUSH_ROWS})", 413)
 
     pcap_name = payload.get("pcap_name", "")
+    try:
+        normalized_rows = [_normalize_ingested_row(row) for row in data]
+    except ValueError as exc:
+        return _error_response(str(exc), 400)
     version = _save(
-        data,
+        normalized_rows,
         pcap_name,
         payload.get("thresholds"),
         payload.get("summary"),
@@ -2302,6 +2455,9 @@ def push():
 
 @app.route("/analyse", methods=["POST"])
 def analyse():
+    access_error = _require_local_access()
+    if access_error:
+        return access_error
     upload = request.files.get("pcap")
     if upload is None:
         return _error_response("No file", 400)
@@ -2342,13 +2498,26 @@ def live_push():
 
     You can also send a batch: { "events": [...], "tracker": {...} }
     """
+    access_error = _require_local_access()
+    if access_error:
+        return access_error
     payload = request.get_json(force=True, silent=True)
     if not payload:
         return _error_response("No payload", 400)
 
-    tracker = payload.get("tracker") or {}
+    try:
+        tracker = _normalize_tracker_snapshot(payload.get("tracker") or {})
+    except ValueError as exc:
+        return _error_response(str(exc), 400)
     iface = payload.get("interface", "")
-    window = int(payload.get("window_seconds", 300))
+    try:
+        window = _coerce_positive_int(
+            payload.get("window_seconds", 300),
+            300,
+            "window_seconds",
+        )
+    except ValueError as exc:
+        return _error_response(str(exc), 400)
 
     # Support single event or batch
     events = payload.get("events")
@@ -2357,9 +2526,17 @@ def live_push():
         if not event:
             return _error_response("Missing 'event' or 'events' key", 400)
         events = [event]
+    elif not isinstance(events, list):
+        return _error_response("'events' must be a list", 400)
 
-    for ev in events:
-        _push_live_event(ev, tracker, iface, window)
+    if len(events) > MAX_LIVE_BATCH:
+        return _error_response(f"Too many events in one batch (max {MAX_LIVE_BATCH})", 413)
+
+    try:
+        for ev in events:
+            _push_live_event(ev, tracker, iface, window)
+    except ValueError as exc:
+        return _error_response(str(exc), 400)
 
     snap = _live_snapshot()
     return jsonify({"ok": True, "version": snap["version"], "total": snap["stats"]["total"]})
@@ -2368,17 +2545,22 @@ def live_push():
 @app.route("/live/status")
 def live_status():
     """Return the current live-mode state and TunnelIPTracker registry."""
+    access_error = _require_local_access()
+    if access_error:
+        return access_error
     since = request.args.get("since", default=0, type=int)
-    snap = _live_snapshot()
+    snap = _live_snapshot(since=since)
     if snap["version"] <= since:
         return jsonify({"version": snap["version"], "new_events": None})
-    # Only send events newer than `since` to avoid re-sending everything
     return jsonify(snap)
 
 
 @app.route("/live/reset", methods=["POST"])
 def live_reset():
     """Clear live-mode state (e.g. start a new session)."""
+    access_error = _require_local_access()
+    if access_error:
+        return access_error
     with _live_lock:
         _live_store.update(
             mode="offline", interface="", window_seconds=300,
@@ -2389,8 +2571,17 @@ def live_reset():
     return jsonify({"ok": True})
 
 
+@app.errorhandler(413)
+def request_too_large(_exc):
+    max_mb = max(1, MAX_CONTENT_LENGTH // (1024 * 1024))
+    return _error_response(f"Upload too large. Max file size is {max_mb} MB.", 413)
+
+
 if __name__ == "__main__":
-    print("\n  DNS Shield v6  →  http://127.0.0.1:8080\n")
+    host = "0.0.0.0" if ALLOW_REMOTE else "127.0.0.1"
+    print(f"\n  DNSGuard dashboard -> http://{host}:8080\n")
     print("  Live push endpoint : POST http://127.0.0.1:8080/live/push")
     print("  Live status        : GET  http://127.0.0.1:8080/live/status\n")
-    app.run(debug=False, host="0.0.0.0", port=8080)
+    if not ALLOW_REMOTE:
+        print("  API access is limited to localhost. Set DNS_SHIELD_ALLOW_REMOTE=1 to expose it remotely.\n")
+    app.run(debug=False, host=host, port=8080)

@@ -2,11 +2,15 @@
 *.pcap
 *.pcapng
 *_results.csv
+!samples/*.pcap
+!samples/*_results.csv
 
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
 .env
 venv/
 .venv/
@@ -18,3 +22,4 @@ Thumbs.db
 # Temp
 tmp/
 *.tmp
+*.log
